@@ -1,0 +1,24 @@
+[package]
+name = "verifier"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+ccatoken = "0.1.0"
+# chrono = { version = "0.4", features = ["serde"]}
+cfg-if = "1.0.0"
+dcap-qvl = "0.3.11"
+ear.workspace = true
+kbs-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# uuid = { version = "1.0", features = ["v4"]}
+
+[features]
+default = ["all-verifiers"]
+all-verifiers = ["cca-verifier", "tdx-verifier"]
+cca-verifier = []
+tdx-verifier = []
