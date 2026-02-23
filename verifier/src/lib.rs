@@ -1,6 +1,7 @@
-use anyhow::{bail, Result};
+use anyhow::{Ok, Result, bail};
 use async_trait::async_trait;
 use cfg_if::cfg_if;
+use ear::{Ear, VerifierID};
 use kbs_types::Tee;
 use serde_json::Value;
 
@@ -31,6 +32,20 @@ pub fn to_verifier(tee: &Tee) -> Result<Box<dyn Verifier + Send + Sync>> {
         }
         _ => bail!("unsupported TEE type"),
     }
+}
+
+fn init_ear(profile_name: &str) -> Result<Ear> {
+    let mut token = Ear::new_with_profile(profile_name)?;
+    token.iat = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    token.vid = VerifierID {
+        build: "verifier-1.0.0".to_string(),
+        developer: "https://veraison-project.org".to_string(),
+    };
+    Ok(token)
 }
 
 pub type TeeEvidenceParsedClaim = Value;
