@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package attestation;
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_PASSPORT = 1;
+  MODE_BACKGROUND_CHECK = 2;
+  MODE_MIX = 3;
+}
+
+enum TEE {
+  TEE_UNSPECIFIED = 0;
+  TEE_CCA = 1;
+}
+
+enum ErrorCode {
+  ErrorCode_OK = 0;
+  ErrorCode_INVALID_ARGUMENT = 1;
+}
+
+message HelloRequest {
+  string version = 1;
+}
+
+message HelloResponse {
+  ErrorCode error_code = 1;
+  TEE tee = 2;
+  Mode mode = 3;
+}
+
+message Evidence {
+  bytes init_data = 1;
+  bytes runtime_data = 2;
+}
+
+message EvidenceList {
+  repeated Evidence evidence = 1;
+}
+
+message AttestationRequest {
+  Mode mode = 1;
+  bytes nonce = 2;
+}
+
+message AttestationResponse {
+  ErrorCode error_code = 1;
+  oneof result {
+    EvidenceList evidence_list = 2;
+    bytes attestation_token = 3;
+  }
+}
+
+message VerificationRequest {
+  repeated Evidence evidence = 1;
+}
+
+message VerificationResponse {
+  ErrorCode error_code = 1;
+  bytes attestation_token = 2;
+}
+
+message RelyingPartyResponse {
+  ErrorCode error_code = 1;
+  optional bytes attestation_token = 2;
+}
+
+service AttestationService {
+    rpc AttestationEvaluate(AttestationRequest) returns (AttestationResponse) {};
+    rpc VerificationEvaluate(VerificationRequest) returns (VerificationResponse) {};
+}
