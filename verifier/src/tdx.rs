@@ -29,7 +29,11 @@ fn init_profile() -> Result<()> {
         EXT_PCK_CHAIN_VERIFIED,
         RawValueKind::Integer,
     )?;
-    register_profile(&profile)?;
+    if let Err(err) = register_profile(&profile)
+        && !err.to_string().to_ascii_lowercase().contains("already")
+    {
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -93,7 +97,7 @@ impl Verifier for TDX {
     async fn verify(&self, raw_evidence: &[u8]) -> Result<String> {
         init_profile()?;
 
-        let quote = check_quote(&raw_evidence)?;
+        let quote = check_quote(raw_evidence)?;
 
         let ear_token = gen_ear_token(&quote)?;
 

@@ -12,11 +12,20 @@ enum Mode {
 enum TEE {
   TEE_UNSPECIFIED = 0;
   TEE_CCA = 1;
+  TEE_TDX = 2;
 }
 
 enum ErrorCode {
   ErrorCode_OK = 0;
   ErrorCode_INVALID_ARGUMENT = 1;
+  ErrorCode_INTERNAL = 2;
+  ErrorCode_UNSUPPORTED_MODE = 3;
+}
+
+enum RpcMethod {
+  RPC_METHOD_UNSPECIFIED = 0;
+  RPC_METHOD_ATTESTATION_EVALUATE = 1;
+  RPC_METHOD_VERIFICATION_EVALUATE = 2;
 }
 
 message HelloRequest {
@@ -63,6 +72,22 @@ message VerificationResponse {
 message RelyingPartyResponse {
   ErrorCode error_code = 1;
   optional bytes attestation_token = 2;
+}
+
+message RpcRequest {
+  RpcMethod method = 1;
+  oneof payload {
+    AttestationRequest attestation_request = 2;
+    VerificationRequest verification_request = 3;
+  }
+}
+
+message RpcResponse {
+  RpcMethod method = 1;
+  oneof payload {
+    AttestationResponse attestation_response = 2;
+    VerificationResponse verification_response = 3;
+  }
 }
 
 service AttestationService {

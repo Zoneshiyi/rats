@@ -1,0 +1,13 @@
+[package]
+name = "attestation-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+kbs-types.workspace = true
+protobuf = "3.7.2"
+protos = { path = "../protos" }
+tokio = { version = "1", features = ["full"] }
+verifier = { path = "../verifier" }

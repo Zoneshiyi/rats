@@ -10,7 +10,11 @@ const PROFILE_NAME: &str = "cca-ear";
 fn init_profile() -> Result<()> {
     let mut profile = Profile::new(PROFILE_NAME);
     profile.register_appraisal_extension("nonce", 11, RawValueKind::Bytes)?;
-    register_profile(&profile)?;
+    if let Err(err) = register_profile(&profile)
+        && !err.to_string().to_ascii_lowercase().contains("already")
+    {
+        return Err(err.into());
+    }
     Ok(())
 }
 
