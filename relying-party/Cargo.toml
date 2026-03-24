@@ -5,9 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
-attestation-service = { path = "../attestation-service" }
 base64 = "0.22.1"
-protobuf = "3.7.2"
 protos = { path = "../protos" }
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tonic = { version = "0.12.3", features = ["transport"] }

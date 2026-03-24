@@ -1,20 +1,24 @@
 use anyhow::{Result, bail};
-use attestation_service::RelyingPartyClient;
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
-use protobuf::Enum;
 use protos::attestation_response;
-use protos::{ErrorCode, Mode, VerificationResponse};
+use protos::attestation_service_client::AttestationServiceClient;
+use protos::{
+    AttestationRequest, AttestationResponse, ErrorCode, Evidence, Mode, VerificationRequest,
+    VerificationResponse,
+};
+use tonic::transport::Channel;
+use tonic::Request;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CliArgs::parse()?;
-    let client = RelyingPartyClient::new(args.addr);
+    let mut client = RelyingPartyClient::connect(args.addr).await?;
     let mode = args.mode;
     let nonce = args.nonce.into_bytes();
 
     let attestation_response = client.attest(mode, nonce).await?;
-    ensure_ok(attestation_response.error_code.enum_value_or_default())?;
+    ensure_ok(attestation_response.error_code)?;
 
     let final_token = match attestation_response.result {
         Some(attestation_response::Result::AttestationToken(token)) => token,
@@ -23,11 +27,45 @@ async fn main() -> Result<()> {
             extract_verification_token(verification_response)?
         }
         None => bail!("missing attestation result"),
-        Some(_) => bail!("unsupported attestation result"),
     };
 
     print_result(mode, &final_token)?;
     Ok(())
+}
+
+struct RelyingPartyClient {
+    inner: AttestationServiceClient<Channel>,
+}
+
+impl RelyingPartyClient {
+    async fn connect(addr: impl Into<String>) -> Result<Self> {
+        let endpoint = format!("http://{}", addr.into());
+        let inner = AttestationServiceClient::connect(endpoint).await?;
+        Ok(Self { inner })
+    }
+
+    async fn attest(&mut self, mode: Mode, nonce: Vec<u8>) -> Result<AttestationResponse> {
+        let request = AttestationRequest {
+            mode: mode as i32,
+            nonce,
+        };
+        let response = self
+            .inner
+            .attestation_evaluate(Request::new(request))
+            .await?
+            .into_inner();
+        Ok(response)
+    }
+
+    async fn verify(&mut self, evidence: Vec<Evidence>) -> Result<VerificationResponse> {
+        let request = VerificationRequest { evidence };
+        let response = self
+            .inner
+            .verification_evaluate(Request::new(request))
+            .await?
+            .into_inner();
+        Ok(response)
+    }
 }
 
 #[derive(Clone)]
@@ -40,7 +78,7 @@ struct CliArgs {
 impl CliArgs {
     fn parse() -> Result<Self> {
         let mut addr = "127.0.0.1:50051".to_string();
-        let mut mode = Mode::MODE_PASSPORT;
+        let mut mode = Mode::Passport;
         let mut nonce = "demo-nonce".to_string();
 
         let mut iter = std::env::args().skip(1).peekable();
@@ -72,31 +110,31 @@ impl CliArgs {
 
 fn parse_mode(raw: &str) -> Result<Mode> {
     match raw.to_ascii_lowercase().as_str() {
-        "passport" => Ok(Mode::MODE_PASSPORT),
-        "background" | "background-check" | "background_check" => Ok(Mode::MODE_BACKGROUND_CHECK),
-        "mix" => Ok(Mode::MODE_MIX),
+        "passport" => Ok(Mode::Passport),
+        "background" | "background-check" | "background_check" => Ok(Mode::BackgroundCheck),
+        "mix" => Ok(Mode::Mix),
         _ => bail!("unsupported mode: {raw}"),
     }
 }
 
 fn extract_verification_token(resp: VerificationResponse) -> Result<Vec<u8>> {
-    ensure_ok(resp.error_code.enum_value_or_default())?;
+    ensure_ok(resp.error_code)?;
     if resp.attestation_token.is_empty() {
         bail!("verification returned empty token");
     }
     Ok(resp.attestation_token)
 }
 
-fn ensure_ok(code: ErrorCode) -> Result<()> {
-    if code == ErrorCode::ErrorCode_OK {
+fn ensure_ok(code: i32) -> Result<()> {
+    if code == ErrorCode::Ok as i32 {
         return Ok(());
     }
-    bail!("remote call failed with code: {:?}", code.value())
+    bail!("remote call failed with code: {}", code)
 }
 
 fn print_result(mode: Mode, token: &[u8]) -> Result<()> {
     let token_text = String::from_utf8(token.to_vec())?;
-    println!("mode: {:?}", mode.value());
+    println!("mode: {:?}", mode as i32);
     println!("final_attestation_token:\n{}\n", token_text);
 
     if let Some(payload) = decode_jwt_payload(&token_text) {

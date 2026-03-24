@@ -1,19 +1,18 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 use kbs_types::Tee;
-use protobuf::{EnumOrUnknown, Message};
 use protos::attestation_response;
-use protos::rpc_request;
-use protos::rpc_response;
+use protos::attestation_service_server::{
+    AttestationService as AttestationServiceApi, AttestationServiceServer,
+};
+use protos::verifier_service_client::VerifierServiceClient;
 use protos::{
-    AttestationRequest, AttestationResponse, ErrorCode, Evidence, EvidenceList, Mode, RpcMethod,
-    RpcRequest, RpcResponse, VerificationRequest, VerificationResponse,
+    AttestationRequest, AttestationResponse, ErrorCode, Evidence, EvidenceList, Mode,
+    Tee as ProtoTee, VerifierRequest, VerificationRequest, VerificationResponse,
 };
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use verifier::to_verifier;
+use tonic::{Request, Response, Status};
 
 #[derive(Debug, Clone)]
 pub struct AttestationEvidence {
@@ -23,10 +22,10 @@ pub struct AttestationEvidence {
 
 impl AttestationEvidence {
     fn to_proto(&self) -> Evidence {
-        let mut evidence = Evidence::new();
-        evidence.init_data = self.init_data.clone();
-        evidence.runtime_data = self.runtime_data.clone();
-        evidence
+        Evidence {
+            init_data: self.init_data.clone(),
+            runtime_data: self.runtime_data.clone(),
+        }
     }
 }
 
@@ -82,219 +81,129 @@ impl AttestationService {
     }
 
     pub async fn attestation_evaluate(&self, req: &AttestationRequest) -> AttestationResponse {
-        let mode = req.mode.enum_value_or_default();
+        let mode = Mode::try_from(req.mode).unwrap_or(Mode::Unspecified);
         let evidences = match self.attester.get_evidence(self.tee, &req.nonce).await {
             Ok(v) => v,
-            Err(_) => return attestation_error(ErrorCode::ErrorCode_INTERNAL),
+            Err(_) => return attestation_error(ErrorCode::Internal),
         };
 
         match mode {
-            Mode::MODE_PASSPORT => {
+            Mode::Passport => {
                 let raw = match evidences.first() {
                     Some(item) => item.runtime_data.as_slice(),
-                    None => return attestation_error(ErrorCode::ErrorCode_INTERNAL),
+                    None => return attestation_error(ErrorCode::Internal),
                 };
                 match verify_by_tee(self.tee, raw).await {
                     Ok(token) => attestation_with_token(token.into_bytes()),
-                    Err(_) => attestation_error(ErrorCode::ErrorCode_INTERNAL),
+                    Err(_) => attestation_error(ErrorCode::Internal),
                 }
             }
-            Mode::MODE_BACKGROUND_CHECK | Mode::MODE_MIX => {
-                let mut list = EvidenceList::new();
-                list.evidence = evidences.iter().map(AttestationEvidence::to_proto).collect();
+            Mode::BackgroundCheck | Mode::Mix => {
+                let list = EvidenceList {
+                    evidence: evidences.iter().map(AttestationEvidence::to_proto).collect(),
+                };
                 attestation_with_evidence(list)
             }
-            Mode::MODE_UNSPECIFIED => attestation_error(ErrorCode::ErrorCode_UNSUPPORTED_MODE),
+            Mode::Unspecified => attestation_error(ErrorCode::UnsupportedMode),
         }
     }
 
     pub async fn verification_evaluate(&self, req: &VerificationRequest) -> VerificationResponse {
         let evidence = match req.evidence.first() {
             Some(v) => v,
-            None => return verification_error(ErrorCode::ErrorCode_INVALID_ARGUMENT),
+            None => return verification_error(ErrorCode::InvalidArgument),
         };
 
         match verify_by_tee(self.tee, &evidence.runtime_data).await {
             Ok(token) => {
-                let mut response = VerificationResponse::new();
-                response.error_code = EnumOrUnknown::new(ErrorCode::ErrorCode_OK);
-                response.attestation_token = token.into_bytes();
-                response
+                VerificationResponse {
+                    error_code: ErrorCode::Ok as i32,
+                    attestation_token: token.into_bytes(),
+                }
             }
-            Err(_) => verification_error(ErrorCode::ErrorCode_INTERNAL),
-        }
-    }
-
-    pub async fn serve(self: Arc<Self>, addr: &str) -> Result<()> {
-        let listener = TcpListener::bind(addr).await?;
-        loop {
-            let (mut stream, _) = listener.accept().await?;
-            let service = Arc::clone(&self);
-            tokio::spawn(async move {
-                if handle_connection(&service, &mut stream).await.is_err() {}
-            });
+            Err(_) => verification_error(ErrorCode::Internal),
         }
     }
 }
 
-pub struct RelyingPartyClient {
-    addr: String,
-}
-
-impl RelyingPartyClient {
-    pub fn new(addr: impl Into<String>) -> Self {
-        Self { addr: addr.into() }
-    }
-
-    pub async fn attest(&self, mode: Mode, nonce: Vec<u8>) -> Result<AttestationResponse> {
-        let mut request = AttestationRequest::new();
-        request.mode = EnumOrUnknown::new(mode);
-        request.nonce = nonce;
-
-        let mut rpc = RpcRequest::new();
-        rpc.method = EnumOrUnknown::new(RpcMethod::RPC_METHOD_ATTESTATION_EVALUATE);
-        rpc.payload = Some(rpc_request::Payload::AttestationRequest(request));
-
-        let mut stream = TcpStream::connect(&self.addr).await?;
-        write_message(&mut stream, &rpc).await?;
-
-        let response: RpcResponse = read_message(&mut stream).await?;
-        let payload = response
-            .payload
-            .ok_or_else(|| anyhow::anyhow!("missing rpc response payload"))?;
-        match payload {
-            rpc_response::Payload::AttestationResponse(resp) => Ok(resp),
-            _ => bail!("unexpected rpc response payload"),
-        }
-    }
-
-    pub async fn verify(&self, evidence: Vec<Evidence>) -> Result<VerificationResponse> {
-        let mut request = VerificationRequest::new();
-        request.evidence = evidence;
-
-        let mut rpc = RpcRequest::new();
-        rpc.method = EnumOrUnknown::new(RpcMethod::RPC_METHOD_VERIFICATION_EVALUATE);
-        rpc.payload = Some(rpc_request::Payload::VerificationRequest(request));
-
-        let mut stream = TcpStream::connect(&self.addr).await?;
-        write_message(&mut stream, &rpc).await?;
-
-        let response: RpcResponse = read_message(&mut stream).await?;
-        let payload = response
-            .payload
-            .ok_or_else(|| anyhow::anyhow!("missing rpc response payload"))?;
-        match payload {
-            rpc_response::Payload::VerificationResponse(resp) => Ok(resp),
-            _ => bail!("unexpected rpc response payload"),
-        }
-    }
+pub fn into_grpc_service(
+    service: Arc<AttestationService>,
+) -> AttestationServiceServer<GrpcAttestationService> {
+    AttestationServiceServer::new(GrpcAttestationService { service })
 }
 
 async fn verify_by_tee(tee: Tee, raw_evidence: &[u8]) -> Result<String> {
-    let verifier = to_verifier(&tee)?;
-    verifier.verify(raw_evidence).await
+    let addr = std::env::var("RATS_VERIFIER_ADDR").unwrap_or("127.0.0.1:50061".to_string());
+    let endpoint = format!("http://{}", addr);
+    let mut client = VerifierServiceClient::connect(endpoint).await?;
+    let tee = match tee {
+        Tee::Cca => ProtoTee::Cca,
+        Tee::Tdx => ProtoTee::Tdx,
+        _ => ProtoTee::Unspecified,
+    };
+    let req = VerifierRequest {
+        tee: tee as i32,
+        evidence: raw_evidence.to_vec(),
+    };
+    let response = client.verify(Request::new(req)).await?.into_inner();
+    if response.error_code != ErrorCode::Ok as i32 {
+        return Err(anyhow::anyhow!(
+            "verifier service failed with code {}",
+            response.error_code
+        ));
+    }
+    Ok(String::from_utf8(response.attestation_token)?)
 }
 
 fn attestation_with_evidence(evidence_list: EvidenceList) -> AttestationResponse {
-    let mut response = AttestationResponse::new();
-    response.error_code = EnumOrUnknown::new(ErrorCode::ErrorCode_OK);
-    response.result = Some(attestation_response::Result::EvidenceList(evidence_list));
-    response
+    AttestationResponse {
+        error_code: ErrorCode::Ok as i32,
+        result: Some(attestation_response::Result::EvidenceList(evidence_list)),
+    }
 }
 
 fn attestation_with_token(token: Vec<u8>) -> AttestationResponse {
-    let mut response = AttestationResponse::new();
-    response.error_code = EnumOrUnknown::new(ErrorCode::ErrorCode_OK);
-    response.result = Some(attestation_response::Result::AttestationToken(token));
-    response
+    AttestationResponse {
+        error_code: ErrorCode::Ok as i32,
+        result: Some(attestation_response::Result::AttestationToken(token)),
+    }
 }
 
 fn attestation_error(error_code: ErrorCode) -> AttestationResponse {
-    let mut response = AttestationResponse::new();
-    response.error_code = EnumOrUnknown::new(error_code);
-    response
+    AttestationResponse {
+        error_code: error_code as i32,
+        result: None,
+    }
 }
 
 fn verification_error(error_code: ErrorCode) -> VerificationResponse {
-    let mut response = VerificationResponse::new();
-    response.error_code = EnumOrUnknown::new(error_code);
-    response
+    VerificationResponse {
+        error_code: error_code as i32,
+        attestation_token: Vec::new(),
+    }
 }
 
-async fn handle_connection(service: &AttestationService, stream: &mut TcpStream) -> Result<()> {
-    let request: RpcRequest = read_message(stream).await?;
-    let method = request.method.enum_value_or_default();
-    let response = match method {
-        RpcMethod::RPC_METHOD_ATTESTATION_EVALUATE => {
-            let payload = request.payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
-            let req = match payload {
-                rpc_request::Payload::AttestationRequest(v) => v,
-                _ => {
-                    let mut rpc = RpcResponse::new();
-                    rpc.method =
-                        EnumOrUnknown::new(RpcMethod::RPC_METHOD_ATTESTATION_EVALUATE);
-                    rpc.payload = Some(rpc_response::Payload::AttestationResponse(
-                        attestation_error(ErrorCode::ErrorCode_INVALID_ARGUMENT),
-                    ));
-                    write_message(stream, &rpc).await?;
-                    return Ok(());
-                }
-            };
-            let attestation_response = service.attestation_evaluate(&req).await;
-            let mut rpc = RpcResponse::new();
-            rpc.method = EnumOrUnknown::new(RpcMethod::RPC_METHOD_ATTESTATION_EVALUATE);
-            rpc.payload = Some(rpc_response::Payload::AttestationResponse(
-                attestation_response,
-            ));
-            rpc
-        }
-        RpcMethod::RPC_METHOD_VERIFICATION_EVALUATE => {
-            let payload = request.payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
-            let req = match payload {
-                rpc_request::Payload::VerificationRequest(v) => v,
-                _ => {
-                    let mut rpc = RpcResponse::new();
-                    rpc.method =
-                        EnumOrUnknown::new(RpcMethod::RPC_METHOD_VERIFICATION_EVALUATE);
-                    rpc.payload = Some(rpc_response::Payload::VerificationResponse(
-                        verification_error(ErrorCode::ErrorCode_INVALID_ARGUMENT),
-                    ));
-                    write_message(stream, &rpc).await?;
-                    return Ok(());
-                }
-            };
-            let verification_response = service.verification_evaluate(&req).await;
-            let mut rpc = RpcResponse::new();
-            rpc.method = EnumOrUnknown::new(RpcMethod::RPC_METHOD_VERIFICATION_EVALUATE);
-            rpc.payload = Some(rpc_response::Payload::VerificationResponse(
-                verification_response,
-            ));
-            rpc
-        }
-        RpcMethod::RPC_METHOD_UNSPECIFIED => {
-            let mut rpc = RpcResponse::new();
-            rpc.method = EnumOrUnknown::new(RpcMethod::RPC_METHOD_UNSPECIFIED);
-            rpc.payload = Some(rpc_response::Payload::AttestationResponse(
-                attestation_error(ErrorCode::ErrorCode_INVALID_ARGUMENT),
-            ));
-            rpc
-        }
-    };
-    write_message(stream, &response).await?;
-    Ok(())
+pub struct GrpcAttestationService {
+    service: Arc<AttestationService>,
 }
 
-async fn write_message<T: Message>(stream: &mut TcpStream, message: &T) -> Result<()> {
-    let bytes = message.write_to_bytes()?;
-    let len = u32::try_from(bytes.len())?;
-    stream.write_u32(len).await?;
-    stream.write_all(&bytes).await?;
-    Ok(())
-}
+#[tonic::async_trait]
+impl AttestationServiceApi for GrpcAttestationService {
+    async fn attestation_evaluate(
+        &self,
+        request: Request<AttestationRequest>,
+    ) -> Result<Response<AttestationResponse>, Status> {
+        let req = request.into_inner();
+        let resp = self.service.attestation_evaluate(&req).await;
+        Ok(Response::new(resp))
+    }
 
-async fn read_message<T: Message + Default>(stream: &mut TcpStream) -> Result<T> {
-    let len = stream.read_u32().await?;
-    let mut bytes = vec![0u8; len as usize];
-    stream.read_exact(&mut bytes).await?;
-    Ok(T::parse_from_bytes(&bytes)?)
+    async fn verification_evaluate(
+        &self,
+        request: Request<VerificationRequest>,
+    ) -> Result<Response<VerificationResponse>, Status> {
+        let req = request.into_inner();
+        let resp = self.service.verification_evaluate(&req).await;
+        Ok(Response::new(resp))
+    }
 }

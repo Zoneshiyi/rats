@@ -1,14 +1,20 @@
 use anyhow::{Result, bail};
-use attestation_service::{AttestationService, FileBackedAttester};
+use attestation_service::{AttestationService, FileBackedAttester, into_grpc_service};
 use kbs_types::Tee;
 use std::sync::Arc;
+use tonic::transport::Server;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let addr = std::env::var("RATS_ATTESTATION_ADDR").unwrap_or("127.0.0.1:50051".to_string());
+    let socket_addr: std::net::SocketAddr = addr.parse()?;
     let tee = parse_tee()?;
     let service = Arc::new(AttestationService::new(tee, Arc::new(FileBackedAttester)));
-    service.serve(&addr).await
+    Server::builder()
+        .add_service(into_grpc_service(service))
+        .serve(socket_addr)
+        .await?;
+    Ok(())
 }
 
 fn parse_tee() -> Result<Tee> {
