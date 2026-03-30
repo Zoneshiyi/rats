@@ -1,0 +1,49 @@
+use anyhow::{Result, bail};
+use kbs_types::Tee;
+use serde::Deserialize;
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AttesterConfig {
+    pub addr: String,
+    pub tee: String,
+    pub verifier_addr: String,
+    pub cca_evidence_path: String,
+    pub tdx_evidence_path: String,
+}
+
+impl AttesterConfig {
+    pub fn load() -> Result<Self> {
+        let path = std::env::var("RATS_ATTESTER_CONFIG")
+            .or_else(|_| std::env::var("RATS_ATTESTATION_CONFIG"))
+            .unwrap_or("configs/attester.toml".to_string());
+        let content = std::fs::read_to_string(path)?;
+        let mut config = toml::from_str::<Self>(&content)?;
+        if let Ok(addr) = std::env::var("RATS_ATTESTER_ADDR") {
+            config.addr = addr;
+        }
+        if let Ok(addr) = std::env::var("RATS_ATTESTATION_ADDR") {
+            config.addr = addr;
+        }
+        if let Ok(tee) = std::env::var("RATS_TEE") {
+            config.tee = tee;
+        }
+        if let Ok(verifier_addr) = std::env::var("RATS_VERIFIER_ADDR") {
+            config.verifier_addr = verifier_addr;
+        }
+        if let Ok(cca_evidence_path) = std::env::var("RATS_CCA_EVIDENCE_PATH") {
+            config.cca_evidence_path = cca_evidence_path;
+        }
+        if let Ok(tdx_evidence_path) = std::env::var("RATS_TDX_EVIDENCE_PATH") {
+            config.tdx_evidence_path = tdx_evidence_path;
+        }
+        Ok(config)
+    }
+
+    pub fn parse_tee(&self) -> Result<Tee> {
+        match self.tee.to_ascii_lowercase().as_str() {
+            "cca" => Ok(Tee::Cca),
+            "tdx" => Ok(Tee::Tdx),
+            _ => bail!("unsupported tee in attester config"),
+        }
+    }
+}

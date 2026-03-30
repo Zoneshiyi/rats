@@ -5,6 +5,9 @@ use ear::{Ear, VerifierID};
 use kbs_types::Tee;
 use serde_json::Value;
 
+pub mod config;
+pub mod service_config;
+
 #[cfg(feature = "cca-verifier")]
 pub mod cca;
 
@@ -35,6 +38,7 @@ pub fn to_verifier(tee: &Tee) -> Result<Box<dyn Verifier + Send + Sync>> {
 }
 
 fn init_ear(profile_name: &str) -> Result<Ear> {
+    let config = config::get();
     let mut token = Ear::new_with_profile(profile_name)?;
     token.iat = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -42,8 +46,8 @@ fn init_ear(profile_name: &str) -> Result<Ear> {
         .as_secs() as i64;
 
     token.vid = VerifierID {
-        build: "verifier-1.0.0".to_string(),
-        developer: "https://veraison-project.org".to_string(),
+        build: config.verifier_build.clone(),
+        developer: config.verifier_developer.clone(),
     };
     Ok(token)
 }

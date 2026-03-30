@@ -1,12 +1,14 @@
 [package]
-name = "verifier-service"
+name = "attester"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 kbs-types.workspace = true
 protos = { path = "../protos" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde.workspace = true
+tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.12.3", features = ["transport"] }
-verifier = { path = "../verifier" }
+toml.workspace = true

@@ -39,25 +39,21 @@
   - `verify()`：串联验证并签名\
     见 verifier/tdx.rs
 
-### 2.3 attestation-service（服务端与协议处理）
+### 2.3 attester（服务端与协议处理）
 
 职责：承接 RP 请求，按模式返回 Token 或 Evidence，并提供 verification 接口。
 
 - `Attester` 抽象：定义 `get_evidence(tee, nonce)`\
   见 attestation-service/lib.rs
-- `FileBackedAttester`：从环境变量路径读取证据，nonce 绑定到 `init_data`\
+- `FileBackedAttester`：从配置路径读取证据，nonce 绑定到 `init_data`\
   见 attestation-service/lib.rs
-- `AttestationService::attestation_evaluate()`：
+- `AttesterService::attestation_evaluate()`：
   - `MODE_PASSPORT`：直接验证并返回 token
   - `MODE_BACKGROUND_CHECK / MODE_MIX`：返回 evidence\_list\
     见 attestation-service/lib.rs
-- `AttestationService::verification_evaluate()`：接收 evidence，调用 verifier 返回 token\
+- `AttesterService::verification_evaluate()`：接收 evidence，调用 verifier 返回 token\
   见 attestation-service/lib.rs
-- `serve()` + `handle_connection()`：TCP 监听、按 `RpcMethod` 分发、回写响应\
-  见 attestation-service/lib.rs
-- 二进制帧编解码：`write_message()` / `read_message()`\
-  见 attestation-service/lib.rs
-- 启动入口：按 `RATS_TEE` 选择 CCA/TDX，按 `RATS_ATTESTATION_ADDR` 监听\
+- 启动入口：按 `RATS_TEE` 选择 CCA/TDX，按 `RATS_ATTESTER_ADDR` 或兼容的 `RATS_ATTESTATION_ADDR` 监听\
   见 attestation-service/main.rs
 
 ### 2.4 relying-party（命令行依赖方）
@@ -97,8 +93,8 @@
 ## 4. 模块关系与调用边界
 
 - **protos** 是唯一协议源，其他模块都依赖它的消息类型。
-- **relying-party** 不直接依赖 verifier，只通过 **attestation-service** 暴露的协议进行交互。
-- **attestation-service** 是编排层：负责模式判断、请求分发、错误码归一化、与 verifier 对接。
+- **relying-party** 不直接依赖 verifier，只通过 **attester** 暴露的协议进行交互。
+- **attester** 是编排层：负责模式判断、请求分发、错误码归一化、与 verifier 对接。
 - **verifier** 是安全判定与签发层：负责证据真实性/完整性评估与 EAR 签名输出。
 
 **RP 负责发起和消费结果，Service 负责协议编排，Verifier 负责信任判断，Protos 负责统一语言。**

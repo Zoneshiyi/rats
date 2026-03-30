@@ -4,12 +4,15 @@ use protos::verifier_service_server::{VerifierService, VerifierServiceServer};
 use protos::{ErrorCode, Tee, VerifierRequest, VerifierResponse};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+use verifier::config::set_global;
+use verifier::service_config::VerifierServiceConfig;
 use verifier::to_verifier;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let addr = std::env::var("RATS_VERIFIER_ADDR").unwrap_or("127.0.0.1:50061".to_string());
-    let socket_addr: std::net::SocketAddr = addr.parse()?;
+    let config = VerifierServiceConfig::load()?;
+    set_global(config.verifier.clone());
+    let socket_addr: std::net::SocketAddr = config.addr.parse()?;
     Server::builder()
         .add_service(VerifierServiceServer::new(GrpcVerifierService))
         .serve(socket_addr)

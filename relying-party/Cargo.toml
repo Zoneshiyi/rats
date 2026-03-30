@@ -7,6 +7,8 @@ edition = "2024"
 anyhow.workspace = true
 base64 = "0.22.1"
 protos = { path = "../protos" }
+serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tonic = { version = "0.12.3", features = ["transport"] }
+toml.workspace = true

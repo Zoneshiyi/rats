@@ -101,8 +101,9 @@ impl Verifier for TDX {
 
         let ear_token = gen_ear_token(&quote)?;
 
-        let pri_key = include_bytes!("../../test_certs/server.pkcs8.pem");
-        let signed_token = ear_token.sign_jwt_pem(Algorithm::ES384, pri_key)?;
+        let config = config::get();
+        let pri_key = config::read_binary(&config.signing_key_path)?;
+        let signed_token = ear_token.sign_jwt_pem(Algorithm::ES384, &pri_key)?;
         Ok(signed_token)
     }
 }

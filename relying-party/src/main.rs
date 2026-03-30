@@ -10,9 +10,12 @@ use protos::{
 use tonic::transport::Channel;
 use tonic::Request;
 
+mod config;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = CliArgs::parse()?;
+    let file_config = config::RelyingPartyConfig::load()?;
+    let args = CliArgs::parse(file_config)?;
     let mut client = RelyingPartyClient::connect(args.addr).await?;
     let mode = args.mode;
     let nonce = args.nonce.into_bytes();
@@ -76,10 +79,10 @@ struct CliArgs {
 }
 
 impl CliArgs {
-    fn parse() -> Result<Self> {
-        let mut addr = "127.0.0.1:50051".to_string();
-        let mut mode = Mode::Passport;
-        let mut nonce = "demo-nonce".to_string();
+    fn parse(file_config: config::RelyingPartyConfig) -> Result<Self> {
+        let mut addr = file_config.addr;
+        let mut mode = parse_mode(&file_config.mode)?;
+        let mut nonce = file_config.nonce;
 
         let mut iter = std::env::args().skip(1).peekable();
         while let Some(arg) = iter.next() {

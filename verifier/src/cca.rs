@@ -19,18 +19,15 @@ fn init_profile() -> Result<()> {
 }
 
 fn check_evidence(e: &mut Evidence) -> Result<()> {
-    // TODO: choose real ta.json
-    let jta: &str = include_str!("../../test_data/cca/ta.json");
+    let config = config::get();
+    let jta = config::read_text(&config.cca_trust_anchors_path)?;
     let mut tas = store::MemoTrustAnchorStore::new();
-    tas.load_json(jta).expect("loading trust anchors");
-    // verify the integrity
+    tas.load_json(&jta).expect("loading trust anchors");
     e.verify(&tas)?;
 
-    // TODO: choose real rv.json
-    let jrv: &str = include_str!("../../test_data/cca/rv.json");
+    let jrv = config::read_text(&config.cca_reference_values_path)?;
     let mut rvs = store::MemoRefValueStore::new();
-    rvs.load_json(jrv).expect("loading reference values");
-    // compare with reference values
+    rvs.load_json(&jrv).expect("loading reference values");
     e.appraise(&rvs)?;
     Ok(())
 }
@@ -77,9 +74,9 @@ impl Verifier for CCA {
 
         let ear_token = gen_ear_token(&e)?;
 
-        // TODO: sign the token with real key
-        let pri_key = include_bytes!("../../test_certs/server.pkcs8.pem");
-        let signed_token = ear_token.sign_jwt_pem(Algorithm::ES384, pri_key)?;
+        let config = config::get();
+        let pri_key = config::read_binary(&config.signing_key_path)?;
+        let signed_token = ear_token.sign_jwt_pem(Algorithm::ES384, &pri_key)?;
 
         Ok(signed_token)
     }

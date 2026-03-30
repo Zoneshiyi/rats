@@ -14,13 +14,15 @@ use std::sync::Arc;
 use tokio::fs;
 use tonic::{Request, Response, Status};
 
+pub mod config;
+
 #[derive(Debug, Clone)]
-pub struct AttestationEvidence {
+pub struct AttesterEvidence {
     pub init_data: Vec<u8>,
     pub runtime_data: Vec<u8>,
 }
 
-impl AttestationEvidence {
+impl AttesterEvidence {
     fn to_proto(&self) -> Evidence {
         Evidence {
             init_data: self.init_data.clone(),
@@ -31,53 +33,63 @@ impl AttestationEvidence {
 
 #[async_trait]
 pub trait Attester {
-    async fn get_evidence(&self, tee: Tee, nonce: &[u8]) -> Result<Vec<AttestationEvidence>>;
+    async fn get_evidence(&self, tee: Tee, nonce: &[u8]) -> Result<Vec<AttesterEvidence>>;
 }
 
-#[derive(Debug, Default)]
-pub struct FileBackedAttester;
+#[derive(Debug)]
+pub struct FileBackedAttester {
+    cca_evidence_path: String,
+    tdx_evidence_path: String,
+}
 
 impl FileBackedAttester {
-    async fn load_runtime_data(&self, tee: Tee) -> Result<Vec<u8>> {
-        let env_key = match tee {
-            Tee::Cca => "RATS_CCA_EVIDENCE_PATH",
-            Tee::Tdx => "RATS_TDX_EVIDENCE_PATH",
-            _ => "RATS_EVIDENCE_PATH",
-        };
-
-        if let Ok(path) = std::env::var(env_key) {
-            let bytes = fs::read(path).await?;
-            return Ok(bytes);
+    pub fn new(cca_evidence_path: String, tdx_evidence_path: String) -> Self {
+        Self {
+            cca_evidence_path,
+            tdx_evidence_path,
         }
+    }
 
-        let fallback = match tee {
-            Tee::Cca => b"mock-cca-evidence".to_vec(),
-            Tee::Tdx => b"mock-tdx-evidence".to_vec(),
-            _ => b"mock-evidence".to_vec(),
+    async fn load_runtime_data(&self, tee: Tee) -> Result<Vec<u8>> {
+        let path = match tee {
+            Tee::Cca => &self.cca_evidence_path,
+            Tee::Tdx => &self.tdx_evidence_path,
+            _ => {
+                return Err(anyhow::anyhow!("unsupported tee for file-backed attester"));
+            }
         };
-        Ok(fallback)
+        Ok(fs::read(path).await?)
     }
 }
 
 #[async_trait]
 impl Attester for FileBackedAttester {
-    async fn get_evidence(&self, tee: Tee, nonce: &[u8]) -> Result<Vec<AttestationEvidence>> {
+    async fn get_evidence(&self, tee: Tee, nonce: &[u8]) -> Result<Vec<AttesterEvidence>> {
         let runtime_data = self.load_runtime_data(tee).await?;
-        Ok(vec![AttestationEvidence {
+        Ok(vec![AttesterEvidence {
             init_data: nonce.to_vec(),
             runtime_data,
         }])
     }
 }
 
-pub struct AttestationService {
+pub struct AttesterService {
     tee: Tee,
+    verifier_addr: String,
     attester: Arc<dyn Attester + Send + Sync>,
 }
 
-impl AttestationService {
-    pub fn new(tee: Tee, attester: Arc<dyn Attester + Send + Sync>) -> Self {
-        Self { tee, attester }
+impl AttesterService {
+    pub fn new(
+        tee: Tee,
+        verifier_addr: String,
+        attester: Arc<dyn Attester + Send + Sync>,
+    ) -> Self {
+        Self {
+            tee,
+            verifier_addr,
+            attester,
+        }
     }
 
     pub async fn attestation_evaluate(&self, req: &AttestationRequest) -> AttestationResponse {
@@ -93,14 +105,14 @@ impl AttestationService {
                     Some(item) => item.runtime_data.as_slice(),
                     None => return attestation_error(ErrorCode::Internal),
                 };
-                match verify_by_tee(self.tee, raw).await {
+                match verify_by_tee(self.tee, raw, &self.verifier_addr).await {
                     Ok(token) => attestation_with_token(token.into_bytes()),
                     Err(_) => attestation_error(ErrorCode::Internal),
                 }
             }
             Mode::BackgroundCheck | Mode::Mix => {
                 let list = EvidenceList {
-                    evidence: evidences.iter().map(AttestationEvidence::to_proto).collect(),
+                    evidence: evidences.iter().map(AttesterEvidence::to_proto).collect(),
                 };
                 attestation_with_evidence(list)
             }
@@ -114,7 +126,7 @@ impl AttestationService {
             None => return verification_error(ErrorCode::InvalidArgument),
         };
 
-        match verify_by_tee(self.tee, &evidence.runtime_data).await {
+        match verify_by_tee(self.tee, &evidence.runtime_data, &self.verifier_addr).await {
             Ok(token) => {
                 VerificationResponse {
                     error_code: ErrorCode::Ok as i32,
@@ -127,14 +139,13 @@ impl AttestationService {
 }
 
 pub fn into_grpc_service(
-    service: Arc<AttestationService>,
-) -> AttestationServiceServer<GrpcAttestationService> {
-    AttestationServiceServer::new(GrpcAttestationService { service })
+    service: Arc<AttesterService>,
+) -> AttestationServiceServer<GrpcAttesterService> {
+    AttestationServiceServer::new(GrpcAttesterService { service })
 }
 
-async fn verify_by_tee(tee: Tee, raw_evidence: &[u8]) -> Result<String> {
-    let addr = std::env::var("RATS_VERIFIER_ADDR").unwrap_or("127.0.0.1:50061".to_string());
-    let endpoint = format!("http://{}", addr);
+async fn verify_by_tee(tee: Tee, raw_evidence: &[u8], verifier_addr: &str) -> Result<String> {
+    let endpoint = format!("http://{}", verifier_addr);
     let mut client = VerifierServiceClient::connect(endpoint).await?;
     let tee = match tee {
         Tee::Cca => ProtoTee::Cca,
@@ -183,12 +194,12 @@ fn verification_error(error_code: ErrorCode) -> VerificationResponse {
     }
 }
 
-pub struct GrpcAttestationService {
-    service: Arc<AttestationService>,
+pub struct GrpcAttesterService {
+    service: Arc<AttesterService>,
 }
 
 #[tonic::async_trait]
-impl AttestationServiceApi for GrpcAttestationService {
+impl AttestationServiceApi for GrpcAttesterService {
     async fn attestation_evaluate(
         &self,
         request: Request<AttestationRequest>,
