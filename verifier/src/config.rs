@@ -8,8 +8,14 @@ pub struct VerifierConfig {
     pub verifier_build: String,
     pub verifier_developer: String,
     pub signing_key_path: String,
+    pub challenge_signing_key_path: String,
+    pub challenge_ttl_secs: u64,
+    pub allow_test_nonce: bool,
     pub cca_trust_anchors_path: String,
     pub cca_reference_values_path: String,
+    pub csv_hsk_cek_dir: String,
+    pub csv_allow_kds_fetch: bool,
+    pub csv_kds_base_url: String,
 }
 
 impl Default for VerifierConfig {
@@ -18,8 +24,14 @@ impl Default for VerifierConfig {
             verifier_build: "verifier-1.0.0".to_string(),
             verifier_developer: "https://veraison-project.org".to_string(),
             signing_key_path: "test_certs/server.pkcs8.pem".to_string(),
+            challenge_signing_key_path: "test_certs/server.pkcs8.pem".to_string(),
+            challenge_ttl_secs: 300,
+            allow_test_nonce: true,
             cca_trust_anchors_path: "test_data/cca/ta.json".to_string(),
             cca_reference_values_path: "test_data/cca/rv.json".to_string(),
+            csv_hsk_cek_dir: "test_data/csv/hsk_cek".to_string(),
+            csv_allow_kds_fetch: false,
+            csv_kds_base_url: "https://cert.hygon.cn".to_string(),
         }
     }
 }
@@ -52,6 +64,10 @@ pub fn read_text(path: &str) -> Result<String> {
 
 pub fn read_binary(path: &str) -> Result<Vec<u8>> {
     Ok(std::fs::read(resolve_path(path))?)
+}
+
+pub fn resolve_existing_path(path: &str) -> PathBuf {
+    resolve_path(path)
 }
 
 fn load_default_file() -> Result<VerifierConfig> {

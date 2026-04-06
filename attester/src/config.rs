@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use kbs_types::Tee;
+use protos::Tee;
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -9,6 +9,8 @@ pub struct AttesterConfig {
     pub verifier_addr: String,
     pub cca_evidence_path: String,
     pub tdx_evidence_path: String,
+    pub csv_evidence_path: String,
+    pub kunpeng_evidence_path: String,
 }
 
 impl AttesterConfig {
@@ -36,6 +38,12 @@ impl AttesterConfig {
         if let Ok(tdx_evidence_path) = std::env::var("RATS_TDX_EVIDENCE_PATH") {
             config.tdx_evidence_path = tdx_evidence_path;
         }
+        if let Ok(csv_evidence_path) = std::env::var("RATS_CSV_EVIDENCE_PATH") {
+            config.csv_evidence_path = csv_evidence_path;
+        }
+        if let Ok(kunpeng_evidence_path) = std::env::var("RATS_KUNPENG_EVIDENCE_PATH") {
+            config.kunpeng_evidence_path = kunpeng_evidence_path;
+        }
         Ok(config)
     }
 
@@ -43,6 +51,8 @@ impl AttesterConfig {
         match self.tee.to_ascii_lowercase().as_str() {
             "cca" => Ok(Tee::Cca),
             "tdx" => Ok(Tee::Tdx),
+            "csv" => Ok(Tee::Csv),
+            "kunpeng" => Ok(Tee::Kunpeng),
             _ => bail!("unsupported tee in attester config"),
         }
     }

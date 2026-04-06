@@ -80,10 +80,9 @@ fn gen_ear_token(quote: &Quote) -> Result<Ear> {
     appraisal
         .extensions
         .set_by_key(EXT_RTMR3, RawValue::Bytes(Bytes(quote.rtmr3().to_vec())))?;
-    appraisal.extensions.set_by_key(
-        EXT_PCK_CHAIN_VERIFIED,
-        RawValue::Integer(1),
-    )?;
+    appraisal
+        .extensions
+        .set_by_key(EXT_PCK_CHAIN_VERIFIED, RawValue::Integer(1))?;
 
     appraisal.update_status_from_trust_vector();
 
@@ -94,12 +93,17 @@ fn gen_ear_token(quote: &Quote) -> Result<Ear> {
 
 #[async_trait]
 impl Verifier for TDX {
-    async fn verify(&self, raw_evidence: &[u8]) -> Result<String> {
+    async fn verify(
+        &self,
+        raw_evidence: &[u8],
+        challenge: &ChallengeTokenClaims,
+    ) -> Result<String> {
         init_profile()?;
 
         let quote = check_quote(raw_evidence)?;
 
-        let ear_token = gen_ear_token(&quote)?;
+        let mut ear_token = gen_ear_token(&quote)?;
+        apply_challenge(&mut ear_token, challenge, "simulated", "file-backed")?;
 
         let config = config::get();
         let pri_key = config::read_binary(&config.signing_key_path)?;
@@ -111,13 +115,21 @@ impl Verifier for TDX {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protos::Tee;
 
     #[tokio::test]
     async fn verify() -> Result<()> {
         let verifier = to_verifier(&Tee::Tdx).expect("failed to create TDX verifier");
         let quote = include_bytes!("../../test_data/tdx/tdx_quote_4.dat");
+        let challenge = ChallengeTokenClaims {
+            tee: 2,
+            mode: 1,
+            nonce: "ZGVtby10ZHgtbm9uY2U".to_string(),
+            issued_at: 0,
+            expires_at: i64::MAX,
+        };
 
-        let signed_token = verifier.verify(quote).await?;
+        let signed_token = verifier.verify(quote, &challenge).await?;
 
         let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
         let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;

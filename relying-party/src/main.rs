@@ -4,11 +4,11 @@ use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use protos::attestation_response;
 use protos::attestation_service_client::AttestationServiceClient;
 use protos::{
-    AttestationRequest, AttestationResponse, ErrorCode, Evidence, Mode, VerificationRequest,
-    VerificationResponse,
+    AttestationRequest, AttestationResponse, ChallengeRequest, ChallengeResponse, ErrorCode,
+    Evidence, Mode, VerificationRequest, VerificationResponse,
 };
-use tonic::transport::Channel;
 use tonic::Request;
+use tonic::transport::Channel;
 
 mod config;
 
@@ -18,15 +18,22 @@ async fn main() -> Result<()> {
     let args = CliArgs::parse(file_config)?;
     let mut client = RelyingPartyClient::connect(args.addr).await?;
     let mode = args.mode;
-    let nonce = args.nonce.into_bytes();
+    let requested_nonce = if args.nonce.is_empty() {
+        Vec::new()
+    } else {
+        args.nonce.into_bytes()
+    };
+    let challenge_response = client.get_challenge(mode, requested_nonce).await?;
+    ensure_ok(challenge_response.error_code)?;
+    let challenge_token = challenge_response.challenge_token;
 
-    let attestation_response = client.attest(mode, nonce).await?;
+    let attestation_response = client.attest(mode, challenge_token.clone()).await?;
     ensure_ok(attestation_response.error_code)?;
 
     let final_token = match attestation_response.result {
         Some(attestation_response::Result::AttestationToken(token)) => token,
         Some(attestation_response::Result::EvidenceList(list)) => {
-            let verification_response = client.verify(list.evidence).await?;
+            let verification_response = client.verify(list.evidence, challenge_token).await?;
             extract_verification_token(verification_response)?
         }
         None => bail!("missing attestation result"),
@@ -47,10 +54,27 @@ impl RelyingPartyClient {
         Ok(Self { inner })
     }
 
-    async fn attest(&mut self, mode: Mode, nonce: Vec<u8>) -> Result<AttestationResponse> {
-        let request = AttestationRequest {
+    async fn get_challenge(&mut self, mode: Mode, nonce: Vec<u8>) -> Result<ChallengeResponse> {
+        let request = ChallengeRequest {
             mode: mode as i32,
             nonce,
+        };
+        let response = self
+            .inner
+            .get_challenge(Request::new(request))
+            .await?
+            .into_inner();
+        Ok(response)
+    }
+
+    async fn attest(
+        &mut self,
+        mode: Mode,
+        challenge_token: Vec<u8>,
+    ) -> Result<AttestationResponse> {
+        let request = AttestationRequest {
+            mode: mode as i32,
+            challenge_token,
         };
         let response = self
             .inner
@@ -60,8 +84,15 @@ impl RelyingPartyClient {
         Ok(response)
     }
 
-    async fn verify(&mut self, evidence: Vec<Evidence>) -> Result<VerificationResponse> {
-        let request = VerificationRequest { evidence };
+    async fn verify(
+        &mut self,
+        evidence: Vec<Evidence>,
+        challenge_token: Vec<u8>,
+    ) -> Result<VerificationResponse> {
+        let request = VerificationRequest {
+            evidence,
+            challenge_token,
+        };
         let response = self
             .inner
             .verification_evaluate(Request::new(request))
@@ -88,15 +119,21 @@ impl CliArgs {
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--addr" => {
-                    let value = iter.next().ok_or_else(|| anyhow::anyhow!("missing --addr"))?;
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("missing --addr"))?;
                     addr = value;
                 }
                 "--mode" => {
-                    let value = iter.next().ok_or_else(|| anyhow::anyhow!("missing --mode"))?;
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("missing --mode"))?;
                     mode = parse_mode(&value)?;
                 }
                 "--nonce" => {
-                    let value = iter.next().ok_or_else(|| anyhow::anyhow!("missing --nonce"))?;
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("missing --nonce"))?;
                     nonce = value;
                 }
                 "--help" | "-h" => {
@@ -167,9 +204,11 @@ fn decode_jwt_payload(token: &str) -> Option<String> {
 
 fn print_usage() {
     println!("Usage:");
-    println!("  relying-party [--addr HOST:PORT] [--mode passport|background-check|mix] [--nonce TEXT]");
+    println!(
+        "  relying-party [--addr HOST:PORT] [--mode passport|background-check|mix] [--nonce TEXT]"
+    );
     println!("Defaults:");
     println!("  --addr 127.0.0.1:50051");
     println!("  --mode passport");
-    println!("  --nonce demo-nonce");
+    println!("  --nonce <empty, verifier generates challenge nonce>");
 }

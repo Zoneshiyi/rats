@@ -1,8 +1,9 @@
-use anyhow::{Ok, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use cfg_if::cfg_if;
-use ear::{Ear, VerifierID};
-use kbs_types::Tee;
+use ear::{Ear, Nonce, RawValue, RawValueKind, VerifierID};
+use protos::Tee;
+use protos::challenge::ChallengeTokenClaims;
 use serde_json::Value;
 
 pub mod config;
@@ -13,6 +14,15 @@ pub mod cca;
 
 #[cfg(feature = "tdx-verifier")]
 pub mod tdx;
+
+#[cfg(feature = "csv-verifier")]
+pub mod csv;
+
+#[cfg(feature = "csv-verifier")]
+pub(crate) mod csv_support;
+
+#[cfg(feature = "kunpeng-verifier")]
+pub mod kunpeng;
 pub fn to_verifier(tee: &Tee) -> Result<Box<dyn Verifier + Send + Sync>> {
     match tee {
         Tee::Cca => {
@@ -33,9 +43,30 @@ pub fn to_verifier(tee: &Tee) -> Result<Box<dyn Verifier + Send + Sync>> {
                 }
             }
         }
+        Tee::Csv => {
+            cfg_if! {
+                if #[cfg(feature = "csv-verifier")] {
+                    Ok(Box::<csv::Csv>::default() as Box<dyn Verifier + Send + Sync>)
+                } else {
+                    bail!("feature `csv-verifier` is not enabled for `verifier` crate.")
+                }
+            }
+        }
+        Tee::Kunpeng => {
+            cfg_if! {
+                if #[cfg(feature = "kunpeng-verifier")] {
+                    Ok(Box::<kunpeng::Kunpeng>::default() as Box<dyn Verifier + Send + Sync>)
+                } else {
+                    bail!("feature `kunpeng-verifier` is not enabled for `verifier` crate.")
+                }
+            }
+        }
         _ => bail!("unsupported TEE type"),
     }
 }
+
+const EXT_CHALLENGE_BINDING: i32 = -70001;
+const EXT_EVIDENCE_SOURCE: i32 = -70002;
 
 fn init_ear(profile_name: &str) -> Result<Ear> {
     let config = config::get();
@@ -52,10 +83,39 @@ fn init_ear(profile_name: &str) -> Result<Ear> {
     Ok(token)
 }
 
+fn apply_challenge(
+    token: &mut Ear,
+    challenge: &ChallengeTokenClaims,
+    challenge_binding: &str,
+    evidence_source: &str,
+) -> Result<()> {
+    token.nonce = Some(Nonce::try_from(challenge.nonce.as_str())?);
+    token.extensions.register(
+        "rats.challenge_binding",
+        EXT_CHALLENGE_BINDING,
+        RawValueKind::String,
+    )?;
+    token.extensions.register(
+        "rats.evidence_source",
+        EXT_EVIDENCE_SOURCE,
+        RawValueKind::String,
+    )?;
+    token.extensions.set_by_name(
+        "rats.challenge_binding",
+        RawValue::String(challenge_binding.to_string()),
+    )?;
+    token.extensions.set_by_name(
+        "rats.evidence_source",
+        RawValue::String(evidence_source.to_string()),
+    )?;
+    Ok(())
+}
+
 pub type TeeEvidenceParsedClaim = Value;
 pub type TeeClass = String;
 
 #[async_trait]
 pub trait Verifier {
-    async fn verify(&self, raw_evidence: &[u8]) -> Result<String>;
+    async fn verify(&self, raw_evidence: &[u8], challenge: &ChallengeTokenClaims)
+    -> Result<String>;
 }

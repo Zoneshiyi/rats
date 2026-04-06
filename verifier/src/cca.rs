@@ -65,14 +65,19 @@ fn gen_ear_token(e: &Evidence) -> Result<Ear> {
 
 #[async_trait]
 impl Verifier for CCA {
-    async fn verify(&self, raw_evidence: &[u8]) -> Result<String> {
+    async fn verify(
+        &self,
+        raw_evidence: &[u8],
+        challenge: &ChallengeTokenClaims,
+    ) -> Result<String> {
         init_profile()?;
 
         let mut e = Evidence::decode(&raw_evidence.to_vec()).expect("decoding CCA token");
 
         check_evidence(&mut e)?;
 
-        let ear_token = gen_ear_token(&e)?;
+        let mut ear_token = gen_ear_token(&e)?;
+        apply_challenge(&mut ear_token, challenge, "simulated", "file-backed")?;
 
         let config = config::get();
         let pri_key = config::read_binary(&config.signing_key_path)?;
@@ -85,12 +90,20 @@ impl Verifier for CCA {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protos::Tee;
 
     #[tokio::test]
     async fn verify() -> Result<()> {
         let verifier = to_verifier(&Tee::Cca).expect("failed to create CCA verifier");
         let token = include_bytes!("../../test_data/cca/cca-token.cbor");
-        let signed_token = verifier.verify(token).await?;
+        let challenge = ChallengeTokenClaims {
+            tee: 1,
+            mode: 1,
+            nonce: "ZGVtby1ub25jZQ".to_string(),
+            issued_at: 0,
+            expires_at: i64::MAX,
+        };
+        let signed_token = verifier.verify(token, &challenge).await?;
 
         let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
         let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
