@@ -24,11 +24,7 @@ unsafe extern "C" {
 }
 
 #[allow(non_snake_case)]
-unsafe fn evp_pkey_ctx_set1_id(
-    ctx: *mut EVP_PKEY_CTX,
-    id: *const c_void,
-    id_len: c_int,
-) -> c_int {
+unsafe fn evp_pkey_ctx_set1_id(ctx: *mut EVP_PKEY_CTX, id: *const c_void, id_len: c_int) -> c_int {
     unsafe { EVP_PKEY_CTX_set1_id(ctx, id, id_len) }
 }
 
@@ -722,9 +718,7 @@ fn sm2_verify(pubkey: &PubKey, signature_der: &[u8], uid: &[u8], message: &[u8])
             bail!("failed to allocate SM2 verification context");
         }
 
-        if evp_pkey_ctx_set1_id(pkey_ctx, uid.as_ptr() as *const c_void, uid.len() as c_int)
-            <= 0
-        {
+        if evp_pkey_ctx_set1_id(pkey_ctx, uid.as_ptr() as *const c_void, uid.len() as c_int) <= 0 {
             EVP_PKEY_CTX_free(pkey_ctx);
             EVP_MD_CTX_free(md_ctx);
             EVP_PKEY_free(pkey);

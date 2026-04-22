@@ -1,6 +1,8 @@
 use anyhow::Result;
 use attester::config::AttesterConfig;
-use attester::{AttesterService, FileBackedAttester, into_grpc_service};
+use attester::{
+    AttesterApplicationService, FileBackedAttester, GrpcVerifierGateway, into_grpc_service,
+};
 use std::sync::Arc;
 use tonic::transport::Server;
 
@@ -15,10 +17,10 @@ async fn main() -> Result<()> {
         config.csv_evidence_path,
         config.kunpeng_evidence_path,
     );
-    let service = Arc::new(AttesterService::new(
+    let service = Arc::new(AttesterApplicationService::new(
         tee,
-        config.verifier_addr,
         Arc::new(attester),
+        Arc::new(GrpcVerifierGateway::new(config.verifier_addr)),
     ));
     Server::builder()
         .add_service(into_grpc_service(service))

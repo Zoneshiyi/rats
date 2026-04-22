@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 base64 = "0.22.1"
 protos = { path = "../protos" }
 serde.workspace = true
