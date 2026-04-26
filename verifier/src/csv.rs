@@ -55,6 +55,7 @@ struct CsvClaims {
     cert_chain_embedded: Option<i64>,
     cert_chain_validation: Option<String>,
     cert_chain_source: Option<String>,
+    challenge_binding_data: Option<Vec<u8>>,
 }
 
 fn init_profile() -> Result<()> {
@@ -126,6 +127,7 @@ async fn normalize_claims(evidence: CsvEvidenceEnvelope) -> Result<CsvClaims> {
                 cert_chain_embedded: None,
                 cert_chain_validation: Some("not_applicable".to_string()),
                 cert_chain_source: Some("mock".to_string()),
+                challenge_binding_data: None,
             })
         }
         CsvEvidenceEnvelope::Trustee { evidence, raw } => {
@@ -134,13 +136,12 @@ async fn normalize_claims(evidence: CsvEvidenceEnvelope) -> Result<CsvClaims> {
             let resolved_chain =
                 resolve_certificate_chain(&serial_number, evidence.cert_chain).await?;
             verify_certificate_chain(&report, &resolved_chain)?;
+            let report_data = report.tee_info().report_data();
 
             Ok(CsvClaims {
                 version: Some(report.version().to_string()),
                 serial_number,
-                report_data: Some(crate::csv_support::encode_hex(
-                    &report.tee_info().report_data(),
-                )),
+                report_data: Some(crate::csv_support::encode_hex(&report_data)),
                 measure: Some(crate::csv_support::encode_hex(&report.tee_info().measure())),
                 policy_json: Some(policy_to_json(report.tee_info().policy())?),
                 user_pubkey_digest: Some(crate::csv_support::encode_hex(
@@ -159,6 +160,7 @@ async fn normalize_claims(evidence: CsvEvidenceEnvelope) -> Result<CsvClaims> {
                     CertificateChainSource::LocalFile => "local-file".to_string(),
                     CertificateChainSource::Kds => "kds".to_string(),
                 }),
+                challenge_binding_data: Some(report_data),
             })
         }
     }
@@ -249,7 +251,16 @@ impl Verifier for Csv {
         let evidence = parse_evidence(raw_evidence)?;
         let claims = normalize_claims(evidence).await?;
         let mut ear_token = gen_ear_token(&claims)?;
-        apply_challenge(&mut ear_token, challenge, "simulated", "file-backed")?;
+        let binding_status = match claims.challenge_binding_data.as_deref() {
+            Some(report_data) => verify_challenge_binding(report_data, challenge)?,
+            None => ChallengeBindingStatus::Simulated,
+        };
+        apply_challenge(
+            &mut ear_token,
+            challenge,
+            binding_status.as_token_value(),
+            "file-backed",
+        )?;
 
         let config = config::get();
         let pri_key = config::read_binary(&config.signing_key_path)?;
@@ -262,17 +273,25 @@ mod tests {
     use super::*;
     use protos::Tee;
 
+    async fn challenge_from_csv_evidence(
+        tee: Tee,
+        raw_evidence: &[u8],
+    ) -> Result<ChallengeTokenClaims> {
+        let evidence = parse_evidence(raw_evidence)?;
+        let claims = normalize_claims(evidence).await?;
+        let report_data = claims
+            .challenge_binding_data
+            .expect("trustee CSV evidence should include report data");
+        let (_nonce, token) =
+            protos::challenge::issue(tee as i32, 1, Some(&report_data), 60, b"test-challenge-key")?;
+        protos::challenge::decode(&token)
+    }
+
     #[tokio::test]
     async fn verify() -> Result<()> {
         let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
         let evidence = include_bytes!("../../test_data/csv/csv_evidence.json");
-        let challenge = ChallengeTokenClaims {
-            tee: Tee::Csv as i32,
-            mode: 1,
-            nonce: "ZGVtby1jc3Ytbm9uY2U".to_string(),
-            issued_at: 0,
-            expires_at: i64::MAX,
-        };
+        let challenge = challenge_from_csv_evidence(Tee::Csv, evidence).await?;
 
         let signed_token = verifier.verify(evidence, &challenge).await?;
         let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
@@ -299,13 +318,12 @@ mod tests {
             .pointer_mut("/cert_chain/pek/sigs/0/signature/r/0")
             .expect("missing mutable PEK signature byte") = serde_json::json!((r0 + 1) % 255);
 
-        let challenge = ChallengeTokenClaims {
-            tee: Tee::Csv as i32,
-            mode: 1,
-            nonce: "dGFtcGVyZWQtY3N2LW5vbmNl".to_string(),
-            issued_at: 0,
-            expires_at: i64::MAX,
-        };
+        let challenge = challenge_from_csv_evidence(
+            Tee::Csv,
+            include_bytes!("../../test_data/csv/csv_evidence.json"),
+        )
+        .await
+        .expect("failed to build CSV fixture challenge");
 
         let result = verifier
             .verify(
@@ -314,5 +332,29 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reject_challenge_mismatch() -> Result<()> {
+        let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
+        let evidence = include_bytes!("../../test_data/csv/csv_evidence.json");
+        let (_nonce, token) = protos::challenge::issue(
+            Tee::Csv as i32,
+            1,
+            Some(b"mismatched-csv-nonce"),
+            60,
+            b"test-challenge-key",
+        )?;
+        let challenge = protos::challenge::decode(&token)?;
+
+        let result = verifier.verify(evidence, &challenge).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("mismatched challenge should fail")
+                .to_string()
+                .contains("challenge/report data mismatch")
+        );
+        Ok(())
     }
 }

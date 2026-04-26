@@ -25,5 +25,6 @@ pub(crate) mod csv_support;
 pub mod kunpeng;
 
 pub use core::{
-    TeeClass, TeeEvidenceParsedClaim, Verifier, apply_challenge, init_ear, to_verifier,
+    ChallengeBindingStatus, TeeClass, TeeEvidenceParsedClaim, Verifier, apply_challenge, init_ear,
+    to_verifier, verify_challenge_binding,
 };

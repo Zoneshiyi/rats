@@ -12,6 +12,21 @@ const EXT_EVIDENCE_SOURCE: i32 = -70002;
 pub type TeeEvidenceParsedClaim = Value;
 pub type TeeClass = String;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ChallengeBindingStatus {
+    HardwareVerified,
+    Simulated,
+}
+
+impl ChallengeBindingStatus {
+    pub fn as_token_value(self) -> &'static str {
+        match self {
+            Self::HardwareVerified => "hardware_verified",
+            Self::Simulated => "simulated",
+        }
+    }
+}
+
 #[async_trait]
 pub trait Verifier {
     async fn verify(&self, raw_evidence: &[u8], challenge: &ChallengeTokenClaims)
@@ -88,6 +103,32 @@ pub fn init_ear(profile_name: &str) -> Result<Ear> {
     Ok(token)
 }
 
+pub fn verify_challenge_binding(
+    extracted_report_data: &[u8],
+    challenge: &ChallengeTokenClaims,
+) -> Result<ChallengeBindingStatus> {
+    let expected = challenge.nonce_bytes()?;
+    if extracted_report_data == expected.as_slice()
+        || is_zero_padded_report_data(extracted_report_data, &expected)
+    {
+        return Ok(ChallengeBindingStatus::HardwareVerified);
+    }
+
+    bail!(
+        "challenge/report data mismatch: expected {} bytes, got {} bytes",
+        expected.len(),
+        extracted_report_data.len()
+    );
+}
+
+fn is_zero_padded_report_data(extracted_report_data: &[u8], expected: &[u8]) -> bool {
+    expected.len() < extracted_report_data.len()
+        && extracted_report_data.starts_with(expected)
+        && extracted_report_data[expected.len()..]
+            .iter()
+            .all(|byte| *byte == 0)
+}
+
 pub fn apply_challenge(
     token: &mut Ear,
     challenge: &ChallengeTokenClaims,
@@ -114,4 +155,56 @@ pub fn apply_challenge(
         RawValue::String(evidence_source.to_string()),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protos::{Mode, Tee, challenge};
+
+    fn challenge_from_nonce(nonce: &[u8]) -> Result<ChallengeTokenClaims> {
+        let (_nonce, token) = challenge::issue(
+            Tee::Tdx as i32,
+            Mode::Passport as i32,
+            Some(nonce),
+            60,
+            b"test-key",
+        )?;
+        challenge::decode(&token)
+    }
+
+    #[test]
+    fn challenge_binding_accepts_exact_nonce() -> Result<()> {
+        let challenge = challenge_from_nonce(b"expected-nonce")?;
+
+        let status = verify_challenge_binding(b"expected-nonce", &challenge)?;
+
+        assert_eq!(status, ChallengeBindingStatus::HardwareVerified);
+        Ok(())
+    }
+
+    #[test]
+    fn challenge_binding_accepts_zero_padded_nonce() -> Result<()> {
+        let challenge = challenge_from_nonce(b"expected-nonce")?;
+        let mut report_data = b"expected-nonce".to_vec();
+        report_data.resize(64, 0);
+
+        let status = verify_challenge_binding(&report_data, &challenge)?;
+
+        assert_eq!(status, ChallengeBindingStatus::HardwareVerified);
+        Ok(())
+    }
+
+    #[test]
+    fn challenge_binding_rejects_nonzero_suffix() -> Result<()> {
+        let challenge = challenge_from_nonce(b"expected-nonce")?;
+        let mut report_data = b"expected-nonce".to_vec();
+        report_data.resize(64, 0);
+        report_data[63] = 1;
+
+        let result = verify_challenge_binding(&report_data, &challenge);
+
+        assert!(result.is_err());
+        Ok(())
+    }
 }

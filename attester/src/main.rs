@@ -1,7 +1,8 @@
 use anyhow::Result;
-use attester::config::AttesterConfig;
+use attester::config::{AttesterConfig, EvidenceSource};
 use attester::{
-    AttesterApplicationService, FileBackedAttester, GrpcVerifierGateway, into_grpc_service,
+    Attester, AttesterApplicationService, FileBackedAttester, GrpcVerifierGateway,
+    GuestComponentsRestAttester, into_grpc_service,
 };
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -11,15 +12,20 @@ async fn main() -> Result<()> {
     let config = AttesterConfig::load()?;
     let socket_addr: std::net::SocketAddr = config.addr.parse()?;
     let tee = config.parse_tee()?;
-    let attester = FileBackedAttester::new(
-        config.cca_evidence_path,
-        config.tdx_evidence_path,
-        config.csv_evidence_path,
-        config.kunpeng_evidence_path,
-    );
+    let attester: Arc<dyn Attester> = match config.parse_evidence_source()? {
+        EvidenceSource::File => Arc::new(FileBackedAttester::new(
+            config.cca_evidence_path,
+            config.tdx_evidence_path,
+            config.csv_evidence_path,
+            config.kunpeng_evidence_path,
+        )),
+        EvidenceSource::GuestComponentsRest => {
+            Arc::new(GuestComponentsRestAttester::new(config.aa_evidence_url))
+        }
+    };
     let service = Arc::new(AttesterApplicationService::new(
         tee,
-        Arc::new(attester),
+        attester,
         Arc::new(GrpcVerifierGateway::new(config.verifier_addr)),
     ));
     Server::builder()

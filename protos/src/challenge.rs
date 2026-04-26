@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 const HEADER_JSON: &str = r#"{"alg":"HS256","typ":"RATS_CHALLENGE"}"#;
-const DEFAULT_RANDOM_NONCE_LEN: usize = 32;
+const DEFAULT_RANDOM_SEED_LEN: usize = 32;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,9 +40,9 @@ pub fn issue(
             raw.to_vec()
         }
         _ => {
-            let mut nonce = vec![0u8; DEFAULT_RANDOM_NONCE_LEN];
-            getrandom(&mut nonce).context("generate random nonce")?;
-            nonce
+            let mut seed = vec![0u8; DEFAULT_RANDOM_SEED_LEN];
+            getrandom(&mut seed).context("generate random nonce")?;
+            URL_SAFE_NO_PAD.encode(seed).into_bytes()
         }
     };
 

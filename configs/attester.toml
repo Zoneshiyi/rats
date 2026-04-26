@@ -1,6 +1,8 @@
 addr = "127.0.0.1:50051"
 tee = "cca"
 verifier_addr = "127.0.0.1:50061"
+evidence_source = "file"
+aa_evidence_url = "http://127.0.0.1:8006/aa/evidence"
 cca_evidence_path = "test_data/cca/cca-token.cbor"
 tdx_evidence_path = "test_data/tdx/tdx_quote_4.dat"
 csv_evidence_path = "test_data/csv/csv_evidence.json"

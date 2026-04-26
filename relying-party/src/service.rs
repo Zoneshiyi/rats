@@ -54,11 +54,7 @@ where
     G: AttestationGateway,
 {
     pub async fn run(&mut self, args: CliArgs) -> Result<WorkflowResult> {
-        let requested_nonce = if args.nonce.is_empty() {
-            Vec::new()
-        } else {
-            args.nonce.into_bytes()
-        };
+        let requested_nonce = args.requested_nonce()?;
         let challenge = self
             .gateway
             .get_challenge(args.mode, requested_nonce)
@@ -147,6 +143,7 @@ mod tests {
             addr: "127.0.0.1:50051".to_string(),
             mode,
             nonce: "expected".to_string(),
+            nonce_b64: None,
         }
     }
 

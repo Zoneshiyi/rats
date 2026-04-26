@@ -102,8 +102,14 @@ impl Verifier for TDX {
 
         let quote = check_quote(raw_evidence)?;
 
+        let binding_status = verify_challenge_binding(&quote.report_input_data(), challenge)?;
         let mut ear_token = gen_ear_token(&quote)?;
-        apply_challenge(&mut ear_token, challenge, "simulated", "file-backed")?;
+        apply_challenge(
+            &mut ear_token,
+            challenge,
+            binding_status.as_token_value(),
+            "file-backed",
+        )?;
 
         let config = config::get();
         let pri_key = config::read_binary(&config.signing_key_path)?;
@@ -117,17 +123,18 @@ mod tests {
     use super::*;
     use protos::Tee;
 
+    fn challenge_from_report_data(tee: Tee, report_data: &[u8]) -> Result<ChallengeTokenClaims> {
+        let (_nonce, token) =
+            protos::challenge::issue(tee as i32, 1, Some(report_data), 60, b"test-challenge-key")?;
+        protos::challenge::decode(&token)
+    }
+
     #[tokio::test]
     async fn verify() -> Result<()> {
         let verifier = to_verifier(&Tee::Tdx).expect("failed to create TDX verifier");
         let quote = include_bytes!("../../test_data/tdx/tdx_quote_4.dat");
-        let challenge = ChallengeTokenClaims {
-            tee: 2,
-            mode: 1,
-            nonce: "ZGVtby10ZHgtbm9uY2U".to_string(),
-            issued_at: 0,
-            expires_at: i64::MAX,
-        };
+        let parsed_quote = check_quote(quote)?;
+        let challenge = challenge_from_report_data(Tee::Tdx, &parsed_quote.report_input_data())?;
 
         let signed_token = verifier.verify(quote, &challenge).await?;
 
@@ -136,6 +143,23 @@ mod tests {
         let token_pretty = serde_json::to_string_pretty(&ear)?;
         println!("verified EAR Token Content (JSON): {}", &token_pretty);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reject_challenge_mismatch() -> Result<()> {
+        let verifier = to_verifier(&Tee::Tdx).expect("failed to create TDX verifier");
+        let quote = include_bytes!("../../test_data/tdx/tdx_quote_4.dat");
+        let challenge = challenge_from_report_data(Tee::Tdx, b"mismatched-tdx-nonce")?;
+
+        let result = verifier.verify(quote, &challenge).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("mismatched challenge should fail")
+                .to_string()
+                .contains("challenge/report data mismatch")
+        );
         Ok(())
     }
 }
