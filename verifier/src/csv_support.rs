@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-use bincode;
 use bitfield::bitfield;
 use libc::{c_int, c_uchar, c_void};
 use openssl::{bn, ecdsa};
@@ -30,7 +29,7 @@ unsafe fn evp_pkey_ctx_set1_id(ctx: *mut EVP_PKEY_CTX, id: *const c_void, id_len
 
 pub(crate) enum CsvEvidenceEnvelope {
     Trustee {
-        evidence: TrusteeCsvEvidence,
+        evidence: Box<TrusteeCsvEvidence>,
         raw: Value,
     },
     Simplified(Value),
@@ -447,8 +446,10 @@ pub(crate) fn parse_evidence(raw_evidence: &[u8]) -> Result<CsvEvidenceEnvelope>
     let value: Value = serde_json::from_slice(raw_evidence)?;
     if value.get("attestation_report").is_some() {
         Ok(CsvEvidenceEnvelope::Trustee {
-            evidence: serde_json::from_value(value.clone())
-                .context("failed to parse trustee-style CSV evidence")?,
+            evidence: Box::new(
+                serde_json::from_value(value.clone())
+                    .context("failed to parse trustee-style CSV evidence")?,
+            ),
             raw: value,
         })
     } else {

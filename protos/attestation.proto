@@ -71,6 +71,7 @@ message VerifierRequest {
   Tee tee = 1;
   bytes evidence = 2;
   bytes challenge_token = 3;
+  string evidence_source = 4;
 }
 
 message VerifierResponse {

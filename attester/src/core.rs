@@ -104,6 +104,34 @@ impl GuestComponentsRestAttester {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct GuestComponentsGrpcAttester {
+    endpoint: String,
+}
+
+impl GuestComponentsGrpcAttester {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Attester for GuestComponentsGrpcAttester {
+    async fn get_evidence(
+        &self,
+        _tee: Tee,
+        challenge: &AttestationChallenge,
+    ) -> Result<Vec<AttesterEvidence>> {
+        validate_aa_runtime_data(&challenge.nonce)?;
+        bail!(
+            "guest-components gRPC evidence provider is reserved for direct AA integration at {}; current implementation only supports the REST bridge",
+            self.endpoint
+        )
+    }
+}
+
 #[async_trait]
 impl Attester for GuestComponentsRestAttester {
     async fn get_evidence(
@@ -145,6 +173,15 @@ impl Attester for GuestComponentsRestAttester {
             runtime_data,
         }])
     }
+}
+
+fn validate_aa_runtime_data(runtime_data: &[u8]) -> Result<()> {
+    if runtime_data.len() > 64 {
+        bail!(
+            "guest-components AA runtime_data must be at most 64 bytes for CCA/TDX/CSV report data fields"
+        );
+    }
+    Ok(())
 }
 
 fn normalize_evidence_url(raw: String) -> String {
@@ -306,6 +343,32 @@ mod tests {
                 .contains("GET /aa/evidence?runtime_data=expected-nonce ")
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn guest_components_grpc_attester_rejects_oversized_runtime_data() {
+        let attester = GuestComponentsGrpcAttester::new("http://127.0.0.1:50000");
+        let err = attester
+            .get_evidence(Tee::Tdx, &test_challenge(&[0u8; 65]))
+            .await
+            .expect_err("oversized runtime_data should fail before RPC integration");
+
+        assert!(err.to_string().contains("at most 64 bytes"));
+    }
+
+    #[tokio::test]
+    async fn guest_components_grpc_attester_reports_reserved_boundary() {
+        let attester = GuestComponentsGrpcAttester::new("http://127.0.0.1:50000");
+        let err = attester
+            .get_evidence(Tee::Tdx, &test_challenge(b"expected-nonce"))
+            .await
+            .expect_err("gRPC provider is a reserved boundary");
+
+        assert!(
+            err.to_string()
+                .contains("reserved for direct AA integration")
+        );
+        assert!(err.to_string().contains("gRPC"));
     }
 
     #[tokio::test]

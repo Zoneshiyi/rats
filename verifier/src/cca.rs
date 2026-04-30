@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::anyhow;
 use ccatoken::{store, token::Evidence};
 use ear::{Algorithm, Appraisal, Bytes, Profile, RawValue, RawValueKind, register_profile};
 
@@ -22,12 +23,14 @@ fn check_evidence(e: &mut Evidence) -> Result<()> {
     let config = config::get();
     let jta = config::read_text(&config.cca_trust_anchors_path)?;
     let mut tas = store::MemoTrustAnchorStore::new();
-    tas.load_json(&jta).expect("loading trust anchors");
+    tas.load_json(&jta)
+        .map_err(|err| anyhow!("loading CCA trust anchors: {err:?}"))?;
     e.verify(&tas)?;
 
     let jrv = config::read_text(&config.cca_reference_values_path)?;
     let mut rvs = store::MemoRefValueStore::new();
-    rvs.load_json(&jrv).expect("loading reference values");
+    rvs.load_json(&jrv)
+        .map_err(|err| anyhow!("loading CCA reference values: {err:?}"))?;
     e.appraise(&rvs)?;
     Ok(())
 }
@@ -65,24 +68,22 @@ fn gen_ear_token(e: &Evidence) -> Result<Ear> {
 
 #[async_trait]
 impl Verifier for CCA {
-    async fn verify(
-        &self,
-        raw_evidence: &[u8],
-        challenge: &ChallengeTokenClaims,
-    ) -> Result<String> {
+    async fn verify(&self, raw_evidence: &[u8], context: &VerificationContext) -> Result<String> {
         init_profile()?;
 
-        let mut e = Evidence::decode(&raw_evidence.to_vec()).expect("decoding CCA token");
+        let mut e = Evidence::decode(&raw_evidence.to_vec())
+            .map_err(|err| anyhow!("decoding CCA token: {err:?}"))?;
 
         check_evidence(&mut e)?;
 
-        let binding_status = verify_challenge_binding(&e.realm_claims.challenge, challenge)?;
+        let binding_status =
+            verify_challenge_binding(&e.realm_claims.challenge, &context.challenge)?;
         let mut ear_token = gen_ear_token(&e)?;
         apply_challenge(
             &mut ear_token,
-            challenge,
+            &context.challenge,
             binding_status.as_token_value(),
-            "file-backed",
+            context.evidence_source(),
         )?;
 
         let config = config::get();
@@ -110,7 +111,8 @@ mod tests {
         let token = include_bytes!("../../test_data/cca/cca-token.cbor");
         let evidence = Evidence::decode(&token.to_vec()).expect("decoding CCA token");
         let challenge = challenge_from_report_data(Tee::Cca, &evidence.realm_claims.challenge)?;
-        let signed_token = verifier.verify(token, &challenge).await?;
+        let context = VerificationContext::new(challenge, "file-backed");
+        let signed_token = verifier.verify(token, &context).await?;
 
         let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
         let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
@@ -125,14 +127,33 @@ mod tests {
         let verifier = to_verifier(&Tee::Cca).expect("failed to create CCA verifier");
         let token = include_bytes!("../../test_data/cca/cca-token.cbor");
         let challenge = challenge_from_report_data(Tee::Cca, b"mismatched-cca-nonce")?;
+        let context = VerificationContext::new(challenge, "file-backed");
 
-        let result = verifier.verify(token, &challenge).await;
+        let result = verifier.verify(token, &context).await;
         assert!(result.is_err());
         assert!(
             result
                 .expect_err("mismatched challenge should fail")
                 .to_string()
                 .contains("challenge/report data mismatch")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_evidence_returns_error() -> Result<()> {
+        let verifier = to_verifier(&Tee::Cca).expect("failed to create CCA verifier");
+        let challenge = challenge_from_report_data(Tee::Cca, b"expected-cca-nonce")?;
+        let context = VerificationContext::new(challenge, "file-backed");
+
+        let result = verifier.verify(b"not-a-cca-token", &context).await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("malformed CCA evidence should fail")
+                .to_string()
+                .contains("decoding CCA token")
         );
         Ok(())
     }

@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use crate::core::{AttestationChallenge, Attester, AttesterEvidence, decode_attestation_challenge};
 
+const DEFAULT_EVIDENCE_SOURCE: &str = "file-backed";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedChallenge {
     pub nonce: Vec<u8>,
@@ -83,12 +85,18 @@ pub trait VerifierGateway: Send + Sync {
         requested_nonce: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)>;
 
-    async fn verify(&self, tee: Tee, raw_evidence: &[u8], challenge_token: &[u8])
-    -> Result<String>;
+    async fn verify(
+        &self,
+        tee: Tee,
+        raw_evidence: &[u8],
+        challenge_token: &[u8],
+        evidence_source: &str,
+    ) -> Result<String>;
 }
 
 pub struct AttesterApplicationService {
     tee: Tee,
+    evidence_source: String,
     attester: Arc<dyn Attester>,
     verifier_gateway: Arc<dyn VerifierGateway>,
 }
@@ -99,8 +107,18 @@ impl AttesterApplicationService {
         attester: Arc<dyn Attester>,
         verifier_gateway: Arc<dyn VerifierGateway>,
     ) -> Self {
+        Self::new_with_evidence_source(tee, DEFAULT_EVIDENCE_SOURCE, attester, verifier_gateway)
+    }
+
+    pub fn new_with_evidence_source(
+        tee: Tee,
+        evidence_source: impl Into<String>,
+        attester: Arc<dyn Attester>,
+        verifier_gateway: Arc<dyn VerifierGateway>,
+    ) -> Self {
         Self {
             tee,
+            evidence_source: evidence_source.into(),
             attester,
             verifier_gateway,
         }
@@ -146,7 +164,12 @@ impl AttesterApplicationService {
                     .ok_or_else(|| ServiceError::internal("missing evidence"))?;
                 let token = self
                     .verifier_gateway
-                    .verify(self.tee, &raw.runtime_data, &challenge.challenge_token)
+                    .verify(
+                        self.tee,
+                        &raw.runtime_data,
+                        &challenge.challenge_token,
+                        &self.evidence_source,
+                    )
                     .await
                     .map_err(|err| ServiceError::internal(err.to_string()))?;
                 Ok(AttestationOutcome::AttestationToken(token.into_bytes()))
@@ -168,7 +191,12 @@ impl AttesterApplicationService {
 
         let token = self
             .verifier_gateway
-            .verify(self.tee, &evidence.runtime_data, &challenge_token)
+            .verify(
+                self.tee,
+                &evidence.runtime_data,
+                &challenge_token,
+                &self.evidence_source,
+            )
             .await
             .map_err(|err| ServiceError::internal(err.to_string()))?;
 
@@ -222,15 +250,19 @@ mod tests {
     }
 
     struct FakeVerifierGateway {
-        issue_result: Mutex<Option<Result<(Vec<u8>, Vec<u8>)>>>,
+        issue_result: Mutex<Option<Result<IssueResult>>>,
         verify_result: Mutex<Option<Result<String>>>,
+        seen_evidence_source: Mutex<Option<String>>,
     }
 
+    type IssueResult = (Vec<u8>, Vec<u8>);
+
     impl FakeVerifierGateway {
-        fn new(issue_result: Result<(Vec<u8>, Vec<u8>)>, verify_result: Result<String>) -> Self {
+        fn new(issue_result: Result<IssueResult>, verify_result: Result<String>) -> Self {
             Self {
                 issue_result: Mutex::new(Some(issue_result)),
                 verify_result: Mutex::new(Some(verify_result)),
+                seen_evidence_source: Mutex::new(None),
             }
         }
     }
@@ -255,7 +287,9 @@ mod tests {
             _tee: Tee,
             _raw_evidence: &[u8],
             _challenge_token: &[u8],
+            evidence_source: &str,
         ) -> Result<String> {
+            *self.seen_evidence_source.lock().unwrap() = Some(evidence_source.to_string());
             self.verify_result
                 .lock()
                 .unwrap()
@@ -295,16 +329,18 @@ mod tests {
 
     #[tokio::test]
     async fn attestation_evaluate_returns_token_for_passport() -> Result<()> {
-        let service = AttesterApplicationService::new(
+        let gateway = Arc::new(FakeVerifierGateway::new(
+            Ok((Vec::new(), Vec::new())),
+            Ok("signed-token".to_string()),
+        ));
+        let service = AttesterApplicationService::new_with_evidence_source(
             Tee::Csv,
+            "guest-components-rest",
             Arc::new(FakeAttester::new(Ok(vec![AttesterEvidence {
                 init_data: b"nonce".to_vec(),
                 runtime_data: b"evidence".to_vec(),
             }]))),
-            Arc::new(FakeVerifierGateway::new(
-                Ok((Vec::new(), Vec::new())),
-                Ok("signed-token".to_string()),
-            )),
+            gateway.clone(),
         );
 
         let result = service
@@ -314,6 +350,10 @@ mod tests {
         assert_eq!(
             result,
             AttestationOutcome::AttestationToken(b"signed-token".to_vec())
+        );
+        assert_eq!(
+            gateway.seen_evidence_source.lock().unwrap().as_deref(),
+            Some("guest-components-rest")
         );
         Ok(())
     }

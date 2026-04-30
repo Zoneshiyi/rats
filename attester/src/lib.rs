@@ -6,6 +6,6 @@ pub mod service;
 pub use api::{GrpcVerifierGateway, into_grpc_service};
 pub use core::{
     AttestationChallenge, Attester, AttesterEvidence, FileBackedAttester,
-    GuestComponentsRestAttester,
+    GuestComponentsGrpcAttester, GuestComponentsRestAttester,
 };
 pub use service::{AttestationOutcome, AttesterApplicationService, IssuedChallenge, ServiceError};

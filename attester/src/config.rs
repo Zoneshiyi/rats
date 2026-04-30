@@ -6,6 +6,17 @@ use serde::Deserialize;
 pub enum EvidenceSource {
     File,
     GuestComponentsRest,
+    GuestComponentsGrpc,
+}
+
+impl EvidenceSource {
+    pub fn as_token_value(self) -> &'static str {
+        match self {
+            Self::File => "file-backed",
+            Self::GuestComponentsRest => "guest-components-rest",
+            Self::GuestComponentsGrpc => "guest-components-grpc",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -86,6 +97,9 @@ impl AttesterConfig {
             "file" | "fixture" | "file-backed" => Ok(EvidenceSource::File),
             "guest-components-rest" | "guest_components_rest" | "coco-rest" | "aa-rest" => {
                 Ok(EvidenceSource::GuestComponentsRest)
+            }
+            "guest-components-grpc" | "guest_components_grpc" | "aa-grpc" => {
+                Ok(EvidenceSource::GuestComponentsGrpc)
             }
             _ => bail!("unsupported evidence_source in attester config"),
         }

@@ -93,22 +93,19 @@ fn gen_ear_token(quote: &Quote) -> Result<Ear> {
 
 #[async_trait]
 impl Verifier for TDX {
-    async fn verify(
-        &self,
-        raw_evidence: &[u8],
-        challenge: &ChallengeTokenClaims,
-    ) -> Result<String> {
+    async fn verify(&self, raw_evidence: &[u8], context: &VerificationContext) -> Result<String> {
         init_profile()?;
 
         let quote = check_quote(raw_evidence)?;
 
-        let binding_status = verify_challenge_binding(&quote.report_input_data(), challenge)?;
+        let binding_status =
+            verify_challenge_binding(&quote.report_input_data(), &context.challenge)?;
         let mut ear_token = gen_ear_token(&quote)?;
         apply_challenge(
             &mut ear_token,
-            challenge,
+            &context.challenge,
             binding_status.as_token_value(),
-            "file-backed",
+            context.evidence_source(),
         )?;
 
         let config = config::get();
@@ -135,8 +132,9 @@ mod tests {
         let quote = include_bytes!("../../test_data/tdx/tdx_quote_4.dat");
         let parsed_quote = check_quote(quote)?;
         let challenge = challenge_from_report_data(Tee::Tdx, &parsed_quote.report_input_data())?;
+        let context = VerificationContext::new(challenge, "file-backed");
 
-        let signed_token = verifier.verify(quote, &challenge).await?;
+        let signed_token = verifier.verify(quote, &context).await?;
 
         let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
         let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
@@ -151,8 +149,9 @@ mod tests {
         let verifier = to_verifier(&Tee::Tdx).expect("failed to create TDX verifier");
         let quote = include_bytes!("../../test_data/tdx/tdx_quote_4.dat");
         let challenge = challenge_from_report_data(Tee::Tdx, b"mismatched-tdx-nonce")?;
+        let context = VerificationContext::new(challenge, "file-backed");
 
-        let result = verifier.verify(quote, &challenge).await;
+        let result = verifier.verify(quote, &context).await;
         assert!(result.is_err());
         assert!(
             result

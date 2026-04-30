@@ -57,6 +57,7 @@ impl VerifierService for GrpcVerifierService {
                 tee: Tee::try_from(req.tee).unwrap_or(Tee::Unspecified),
                 evidence: req.evidence,
                 challenge_token: req.challenge_token,
+                evidence_source: req.evidence_source,
             })
             .await
             .map_err(map_service_error)?;
