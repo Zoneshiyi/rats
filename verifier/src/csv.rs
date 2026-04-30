@@ -241,25 +241,25 @@ fn gen_ear_token(claims: &CsvClaims) -> Result<Ear> {
 
 #[async_trait]
 impl Verifier for Csv {
-    async fn verify(
-        &self,
-        raw_evidence: &[u8],
-        challenge: &ChallengeTokenClaims,
-    ) -> Result<String> {
+    async fn verify(&self, raw_evidence: &[u8], context: &VerificationContext) -> Result<String> {
         init_profile()?;
 
         let evidence = parse_evidence(raw_evidence)?;
         let claims = normalize_claims(evidence).await?;
         let mut ear_token = gen_ear_token(&claims)?;
+        let appraisal = context
+            .appraisal_policy()
+            .evaluate_csv_measurement(claims.measure.as_deref())?;
         let binding_status = match claims.challenge_binding_data.as_deref() {
-            Some(report_data) => verify_challenge_binding(report_data, challenge)?,
+            Some(report_data) => verify_challenge_binding(report_data, &context.challenge)?,
             None => ChallengeBindingStatus::Simulated,
         };
+        apply_appraisal(&mut ear_token, appraisal)?;
         apply_challenge(
             &mut ear_token,
-            challenge,
+            &context.challenge,
             binding_status.as_token_value(),
-            "file-backed",
+            context.evidence_source(),
         )?;
 
         let config = config::get();
@@ -287,13 +287,44 @@ mod tests {
         protos::challenge::decode(&token)
     }
 
+    async fn csv_fixture_context(raw_evidence: &[u8]) -> Result<Option<VerificationContext>> {
+        match challenge_from_csv_evidence(Tee::Csv, raw_evidence).await {
+            Ok(challenge) => Ok(Some(VerificationContext::new(challenge, "file-backed"))),
+            Err(err) if is_missing_csv_bundle(&err) => {
+                eprintln!("skipping CSV fixture test: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn is_missing_csv_bundle(err: &anyhow::Error) -> bool {
+        err.to_string().contains("missing HSK/CEK")
+            || err
+                .chain()
+                .any(|cause| cause.to_string().contains("missing HSK/CEK"))
+    }
+
+    fn simplified_csv_evidence(measure: &str) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "version": "mock-v1",
+            "serial_number": "mock-csv",
+            "report_data": "expected-nonce",
+            "measure": measure,
+            "policy": {},
+            "user_pubkey_digest": "",
+        }))?)
+    }
+
     #[tokio::test]
     async fn verify() -> Result<()> {
         let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
         let evidence = include_bytes!("../../test_data/csv/csv_evidence.json");
-        let challenge = challenge_from_csv_evidence(Tee::Csv, evidence).await?;
+        let Some(context) = csv_fixture_context(evidence).await? else {
+            return Ok(());
+        };
 
-        let signed_token = verifier.verify(evidence, &challenge).await?;
+        let signed_token = verifier.verify(evidence, &context).await?;
         let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
         let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
         let token_pretty = serde_json::to_string_pretty(&ear)?;
@@ -305,7 +336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reject_tampered_pek_signature() {
+    async fn reject_tampered_pek_signature() -> Result<()> {
         let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
         let mut evidence: Value =
             serde_json::from_slice(include_bytes!("../../test_data/csv/csv_evidence.json"))
@@ -318,26 +349,29 @@ mod tests {
             .pointer_mut("/cert_chain/pek/sigs/0/signature/r/0")
             .expect("missing mutable PEK signature byte") = serde_json::json!((r0 + 1) % 255);
 
-        let challenge = challenge_from_csv_evidence(
-            Tee::Csv,
-            include_bytes!("../../test_data/csv/csv_evidence.json"),
-        )
-        .await
-        .expect("failed to build CSV fixture challenge");
+        let Some(context) =
+            csv_fixture_context(include_bytes!("../../test_data/csv/csv_evidence.json")).await?
+        else {
+            return Ok(());
+        };
 
         let result = verifier
             .verify(
                 &serde_json::to_vec(&evidence).expect("failed to serialize tampered evidence"),
-                &challenge,
+                &context,
             )
             .await;
         assert!(result.is_err());
+        Ok(())
     }
 
     #[tokio::test]
     async fn reject_challenge_mismatch() -> Result<()> {
         let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
         let evidence = include_bytes!("../../test_data/csv/csv_evidence.json");
+        if csv_fixture_context(evidence).await?.is_none() {
+            return Ok(());
+        }
         let (_nonce, token) = protos::challenge::issue(
             Tee::Csv as i32,
             1,
@@ -346,8 +380,9 @@ mod tests {
             b"test-challenge-key",
         )?;
         let challenge = protos::challenge::decode(&token)?;
+        let context = VerificationContext::new(challenge, "file-backed");
 
-        let result = verifier.verify(evidence, &challenge).await;
+        let result = verifier.verify(evidence, &context).await;
         assert!(result.is_err());
         assert!(
             result
@@ -355,6 +390,74 @@ mod tests {
                 .to_string()
                 .contains("challenge/report data mismatch")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simplified_csv_policy_accepts_allowed_measurement() -> Result<()> {
+        let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
+        let evidence = simplified_csv_evidence("abc123")?;
+        let challenge = ChallengeTokenClaims {
+            tee: Tee::Csv as i32,
+            mode: 1,
+            nonce: "ZXhwZWN0ZWQtbm9uY2U".to_string(),
+            issued_at: 0,
+            expires_at: i64::MAX,
+        };
+        let policy = AppraisalPolicy::from_toml(
+            r#"
+policy_id = "csv-week-two"
+csv_allowed_measurements = ["abc123"]
+"#,
+        )?;
+        let context =
+            VerificationContext::new(challenge, "file-backed").with_appraisal_policy(policy);
+
+        let signed_token = verifier.verify(&evidence, &context).await?;
+        let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
+        let mut ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
+        ear.extensions
+            .register("rats.appraisal_policy_id", -70003, RawValueKind::String)?;
+        ear.extensions
+            .register("rats.appraisal_result", -70004, RawValueKind::String)?;
+
+        assert_eq!(
+            ear.extensions.get_by_name("rats.appraisal_policy_id"),
+            Some(RawValue::String("csv-week-two".to_string()))
+        );
+        assert_eq!(
+            ear.extensions.get_by_name("rats.appraisal_result"),
+            Some(RawValue::String("passed".to_string()))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simplified_csv_policy_rejects_unexpected_measurement() -> Result<()> {
+        let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
+        let evidence = simplified_csv_evidence("unexpected")?;
+        let challenge = ChallengeTokenClaims {
+            tee: Tee::Csv as i32,
+            mode: 1,
+            nonce: "ZXhwZWN0ZWQtbm9uY2U".to_string(),
+            issued_at: 0,
+            expires_at: i64::MAX,
+        };
+        let policy = AppraisalPolicy::from_toml(
+            r#"
+policy_id = "csv-week-two"
+csv_allowed_measurements = ["expected"]
+"#,
+        )?;
+        let context =
+            VerificationContext::new(challenge, "file-backed").with_appraisal_policy(policy);
+
+        let err = verifier
+            .verify(&evidence, &context)
+            .await
+            .expect_err("unexpected measurement should fail policy");
+
+        assert!(err.to_string().contains("rejected CSV measurement"));
         Ok(())
     }
 }

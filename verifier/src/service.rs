@@ -4,7 +4,7 @@ use protos::challenge::{self, ChallengeTokenClaims};
 use std::sync::Arc;
 
 use crate::config::VerifierConfig;
-use crate::core::{DefaultVerifierFactory, VerifierFactory};
+use crate::core::{AppraisalPolicy, DefaultVerifierFactory, VerificationContext, VerifierFactory};
 
 #[derive(Debug, Clone)]
 pub struct IssueChallengeInput {
@@ -24,11 +24,68 @@ pub struct VerifyEvidenceInput {
     pub tee: Tee,
     pub evidence: Vec<u8>,
     pub challenge_token: Vec<u8>,
+    pub evidence_source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedToken {
     pub attestation_token: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditEventKind {
+    ChallengeIssued,
+    VerificationAccepted,
+    VerificationRejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEvent {
+    pub kind: AuditEventKind,
+    pub tee: Tee,
+    pub mode: i32,
+    pub challenge_id: String,
+    pub evidence_source: String,
+    pub reason: Option<String>,
+}
+
+impl AuditEvent {
+    pub fn challenge_issued(tee: Tee, claims: &ChallengeTokenClaims) -> Self {
+        Self {
+            kind: AuditEventKind::ChallengeIssued,
+            tee,
+            mode: claims.mode,
+            challenge_id: claims.challenge_id(),
+            evidence_source: "not_applicable".to_string(),
+            reason: None,
+        }
+    }
+
+    pub fn verification_accepted(tee: Tee, context: &VerificationContext) -> Self {
+        Self {
+            kind: AuditEventKind::VerificationAccepted,
+            tee,
+            mode: context.challenge.mode,
+            challenge_id: context.challenge_id(),
+            evidence_source: context.evidence_source().to_string(),
+            reason: None,
+        }
+    }
+
+    pub fn verification_rejected(
+        tee: Tee,
+        context: &VerificationContext,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: AuditEventKind::VerificationRejected,
+            tee,
+            mode: context.challenge.mode,
+            challenge_id: context.challenge_id(),
+            evidence_source: context.evidence_source().to_string(),
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +174,7 @@ pub struct ServiceConfig {
     pub challenge_ttl_secs: u64,
     pub allow_test_nonce: bool,
     pub challenge_signing_key: Vec<u8>,
+    pub appraisal_policy: AppraisalPolicy,
 }
 
 impl ServiceConfig {
@@ -125,6 +183,7 @@ impl ServiceConfig {
             challenge_ttl_secs: config.challenge_ttl_secs,
             allow_test_nonce: config.allow_test_nonce,
             challenge_signing_key: crate::config::read_binary(&config.challenge_signing_key_path)?,
+            appraisal_policy: AppraisalPolicy::from_runtime_config(config)?,
         })
     }
 }
@@ -211,10 +270,19 @@ impl VerifierApplicationService {
             .verifier_factory
             .resolve(input.tee)
             .map_err(|err| ServiceError::internal(err.to_string()))?;
-        let token = verifier
-            .verify(&input.evidence, &challenge)
-            .await
-            .map_err(|err| ServiceError::internal(err.to_string()))?;
+        let context = VerificationContext::new(challenge, input.evidence_source)
+            .with_appraisal_policy(self.config.appraisal_policy.clone());
+        let token = match verifier.verify(&input.evidence, &context).await {
+            Ok(token) => {
+                let _event = AuditEvent::verification_accepted(input.tee, &context);
+                token
+            }
+            Err(err) => {
+                let _event =
+                    AuditEvent::verification_rejected(input.tee, &context, err.to_string());
+                return Err(ServiceError::internal(err.to_string()));
+            }
+        };
 
         Ok(VerifiedToken {
             attestation_token: token.into_bytes(),
@@ -231,13 +299,15 @@ mod tests {
     use std::sync::Mutex;
 
     struct FakeChallengeTokens {
-        issue_result: Mutex<Option<Result<(Vec<u8>, Vec<u8>)>>>,
+        issue_result: Mutex<Option<Result<IssueResult>>>,
         verify_result: Mutex<Option<Result<ChallengeTokenClaims>>>,
     }
 
+    type IssueResult = (Vec<u8>, Vec<u8>);
+
     impl FakeChallengeTokens {
         fn new(
-            issue_result: Result<(Vec<u8>, Vec<u8>)>,
+            issue_result: Result<IssueResult>,
             verify_result: Result<ChallengeTokenClaims>,
         ) -> Self {
             Self {
@@ -303,12 +373,24 @@ mod tests {
 
     struct FakeVerifier {
         result: Mutex<Option<Result<String>>>,
+        seen_evidence_source: Option<Arc<Mutex<Option<String>>>>,
     }
 
     impl FakeVerifier {
         fn new(result: Result<String>) -> Self {
             Self {
                 result: Mutex::new(Some(result)),
+                seen_evidence_source: None,
+            }
+        }
+
+        fn recording(
+            result: Result<String>,
+            seen_evidence_source: Arc<Mutex<Option<String>>>,
+        ) -> Self {
+            Self {
+                result: Mutex::new(Some(result)),
+                seen_evidence_source: Some(seen_evidence_source),
             }
         }
     }
@@ -318,8 +400,11 @@ mod tests {
         async fn verify(
             &self,
             _raw_evidence: &[u8],
-            _challenge: &ChallengeTokenClaims,
+            context: &VerificationContext,
         ) -> Result<String> {
+            if let Some(seen_evidence_source) = &self.seen_evidence_source {
+                *seen_evidence_source.lock().unwrap() = Some(context.evidence_source().to_string());
+            }
             self.result
                 .lock()
                 .unwrap()
@@ -333,6 +418,7 @@ mod tests {
             challenge_ttl_secs: 60,
             allow_test_nonce: true,
             challenge_signing_key: b"test-key".to_vec(),
+            appraisal_policy: AppraisalPolicy::disabled(),
         }
     }
 
@@ -344,6 +430,30 @@ mod tests {
             issued_at: 0,
             expires_at: i64::MAX,
         }
+    }
+
+    #[test]
+    fn audit_event_uses_challenge_id_and_evidence_source() {
+        let context = VerificationContext::new(test_challenge(), "guest-components-grpc");
+
+        let event = AuditEvent::verification_accepted(Tee::Csv, &context);
+
+        assert_eq!(event.kind, AuditEventKind::VerificationAccepted);
+        assert_eq!(event.tee, Tee::Csv);
+        assert_eq!(event.mode, 1);
+        assert_eq!(event.evidence_source, "guest-components-grpc");
+        assert_eq!(event.challenge_id, context.challenge_id());
+        assert_eq!(event.reason, None);
+    }
+
+    #[test]
+    fn audit_rejection_event_records_reason() {
+        let context = VerificationContext::new(test_challenge(), "file-backed");
+
+        let event = AuditEvent::verification_rejected(Tee::Csv, &context, "policy failed");
+
+        assert_eq!(event.kind, AuditEventKind::VerificationRejected);
+        assert_eq!(event.reason.as_deref(), Some("policy failed"));
     }
 
     #[tokio::test]
@@ -416,11 +526,46 @@ mod tests {
                 tee: Tee::Csv,
                 evidence: b"evidence".to_vec(),
                 challenge_token: b"challenge".to_vec(),
+                evidence_source: "guest-components-rest".to_string(),
             })
             .await
             .expect("verification should succeed");
 
         assert_eq!(result.attestation_token, b"signed-token");
+    }
+
+    #[tokio::test]
+    async fn verify_passes_evidence_source_to_verifier() {
+        let seen_evidence_source = Arc::new(Mutex::new(None));
+        let service = VerifierApplicationService::new(
+            test_config(),
+            Arc::new(FakeVerifierFactory::with_result(Ok(Box::new(
+                FakeVerifier::recording(
+                    Ok("signed-token".to_string()),
+                    seen_evidence_source.clone(),
+                ),
+            )))),
+            Arc::new(FakeChallengeTokens::new(
+                Ok((Vec::new(), Vec::new())),
+                Ok(test_challenge()),
+            )),
+        );
+
+        let result = service
+            .verify(VerifyEvidenceInput {
+                tee: Tee::Csv,
+                evidence: b"evidence".to_vec(),
+                challenge_token: b"challenge".to_vec(),
+                evidence_source: "guest-components-rest".to_string(),
+            })
+            .await
+            .expect("verification should succeed");
+
+        assert_eq!(result.attestation_token, b"signed-token");
+        assert_eq!(
+            seen_evidence_source.lock().unwrap().as_deref(),
+            Some("guest-components-rest")
+        );
     }
 
     #[tokio::test]
@@ -439,6 +584,7 @@ mod tests {
                 tee: Tee::Csv,
                 evidence: b"evidence".to_vec(),
                 challenge_token: b"challenge".to_vec(),
+                evidence_source: "file-backed".to_string(),
             })
             .await;
 

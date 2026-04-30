@@ -16,6 +16,8 @@ pub struct VerifierConfig {
     pub csv_hsk_cek_dir: String,
     pub csv_allow_kds_fetch: bool,
     pub csv_kds_base_url: String,
+    #[serde(default)]
+    pub appraisal_policy_path: Option<String>,
 }
 
 impl Default for VerifierConfig {
@@ -32,6 +34,7 @@ impl Default for VerifierConfig {
             csv_hsk_cek_dir: "test_data/csv/hsk_cek".to_string(),
             csv_allow_kds_fetch: false,
             csv_kds_base_url: "https://cert.hygon.cn".to_string(),
+            appraisal_policy_path: None,
         }
     }
 }

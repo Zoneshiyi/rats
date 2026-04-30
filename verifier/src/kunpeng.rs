@@ -85,16 +85,17 @@ fn gen_ear_token(evidence: &KunpengEvidence) -> Result<Ear> {
 
 #[async_trait]
 impl Verifier for Kunpeng {
-    async fn verify(
-        &self,
-        raw_evidence: &[u8],
-        challenge: &ChallengeTokenClaims,
-    ) -> Result<String> {
+    async fn verify(&self, raw_evidence: &[u8], context: &VerificationContext) -> Result<String> {
         init_profile()?;
 
         let evidence = parse_evidence(raw_evidence)?;
         let mut ear_token = gen_ear_token(&evidence)?;
-        apply_challenge(&mut ear_token, challenge, "simulated", "file-backed")?;
+        apply_challenge(
+            &mut ear_token,
+            &context.challenge,
+            "simulated",
+            context.evidence_source(),
+        )?;
 
         let config = config::get();
         let pri_key = config::read_binary(&config.signing_key_path)?;
@@ -118,8 +119,9 @@ mod tests {
             issued_at: 0,
             expires_at: i64::MAX,
         };
+        let context = VerificationContext::new(challenge, "file-backed");
 
-        let signed_token = verifier.verify(evidence, &challenge).await?;
+        let signed_token = verifier.verify(evidence, &context).await?;
         let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
         let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
         let token_pretty = serde_json::to_string_pretty(&ear)?;

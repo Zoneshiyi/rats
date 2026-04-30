@@ -4,7 +4,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use getrandom::getrandom;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 const HEADER_JSON: &str = r#"{"alg":"HS256","typ":"RATS_CHALLENGE"}"#;
 const DEFAULT_RANDOM_SEED_LEN: usize = 32;
@@ -24,6 +24,16 @@ impl ChallengeTokenClaims {
         URL_SAFE_NO_PAD
             .decode(self.nonce.as_bytes())
             .context("decode challenge nonce")
+    }
+
+    pub fn challenge_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.tee.to_be_bytes());
+        hasher.update(self.mode.to_be_bytes());
+        hasher.update(self.nonce.as_bytes());
+        hasher.update(self.issued_at.to_be_bytes());
+        hasher.update(self.expires_at.to_be_bytes());
+        URL_SAFE_NO_PAD.encode(hasher.finalize())
     }
 }
 
@@ -101,11 +111,13 @@ pub fn verify(
     }
 
     let signing_input = format!("{}.{}", header, payload);
-    let expected_signature = hmac_sha256(signing_key, signing_input.as_bytes())?;
     let actual_signature = URL_SAFE_NO_PAD
         .decode(signature.as_bytes())
         .context("decode challenge signature")?;
-    if actual_signature != expected_signature {
+    let mut mac =
+        HmacSha256::new_from_slice(signing_key).context("create challenge signing key")?;
+    mac.update(signing_input.as_bytes());
+    if mac.verify_slice(&actual_signature).is_err() {
         bail!("invalid challenge token signature");
     }
 
@@ -147,4 +159,57 @@ fn validate_nonce(nonce: &[u8]) -> Result<()> {
         bail!("nonce must be between 8 and 64 bytes");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_rejects_tampered_payload() -> Result<()> {
+        let (_nonce, token) = issue(1, 1, Some(b"expected-nonce"), 60, b"test-key")?;
+        let mut parts = std::str::from_utf8(&token)?
+            .split('.')
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let mut claims = decode(&token)?;
+        claims.mode = 2;
+        parts[1] = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
+        let tampered = parts.join(".");
+
+        let result = verify(tampered.as_bytes(), Some(1), Some(2), b"test-key");
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("tampered token should fail")
+                .to_string()
+                .contains("invalid challenge token signature")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verify_rejects_tampered_signature() -> Result<()> {
+        let (_nonce, token) = issue(1, 1, Some(b"expected-nonce"), 60, b"test-key")?;
+        let mut token = token;
+        let last = token.last_mut().expect("token should not be empty");
+        *last = if *last == b'A' { b'B' } else { b'A' };
+
+        let result = verify(&token, Some(1), Some(1), b"test-key");
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn challenge_id_is_stable_for_same_claims() -> Result<()> {
+        let (_nonce, token) = issue(1, 1, Some(b"expected-nonce"), 60, b"test-key")?;
+        let first = decode(&token)?;
+        let second = decode(&token)?;
+
+        assert_eq!(first.challenge_id(), second.challenge_id());
+        assert!(!first.challenge_id().is_empty());
+        Ok(())
+    }
 }
