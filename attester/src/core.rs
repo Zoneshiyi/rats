@@ -2,6 +2,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use protos::attestation_agent::{
+    GetEvidenceRequest, attestation_agent_service_client::AttestationAgentServiceClient,
+};
 use protos::challenge::decode as decode_challenge_token;
 use protos::{Evidence, Mode, Tee};
 use serde::Deserialize;
@@ -121,14 +124,36 @@ impl GuestComponentsGrpcAttester {
 impl Attester for GuestComponentsGrpcAttester {
     async fn get_evidence(
         &self,
-        _tee: Tee,
+        tee: Tee,
         challenge: &AttestationChallenge,
     ) -> Result<Vec<AttesterEvidence>> {
         validate_aa_runtime_data(&challenge.nonce)?;
-        bail!(
-            "guest-components gRPC evidence provider is reserved for direct AA integration at {}; current implementation only supports the REST bridge",
-            self.endpoint
-        )
+
+        let mut client = AttestationAgentServiceClient::connect(self.endpoint.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to connect to guest-components AA at {}",
+                    self.endpoint
+                )
+            })?;
+        let response = client
+            .get_evidence(GetEvidenceRequest {
+                runtime_data: challenge.nonce.clone(),
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to request guest-components gRPC evidence from {}",
+                    self.endpoint
+                )
+            })?;
+        let runtime_data =
+            normalize_guest_components_evidence(tee, &response.into_inner().evidence)?;
+        Ok(vec![AttesterEvidence {
+            init_data: challenge.nonce.clone(),
+            runtime_data,
+        }])
     }
 }
 
@@ -217,8 +242,8 @@ fn normalize_guest_components_evidence(tee: Tee, raw: &[u8]) -> Result<Vec<u8>> 
             decode_base64(&evidence.quote).context("failed to decode guest-components TDX quote")
         }
         Tee::Csv => Ok(raw.to_vec()),
-        Tee::Kunpeng => bail!("guest-components REST evidence does not support Kunpeng"),
-        _ => bail!("unsupported tee for guest-components REST attester"),
+        Tee::Kunpeng => bail!("guest-components evidence does not support Kunpeng"),
+        _ => bail!("unsupported tee for guest-components attester"),
     }
 }
 
@@ -273,9 +298,22 @@ mod tests {
     use super::*;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use protos::attestation_agent::{
+        BindInitDataRequest, BindInitDataResponse, ExtendRuntimeMeasurementRequest,
+        ExtendRuntimeMeasurementResponse, GetAdditionalEvidenceRequest, GetAdditionalTeesRequest,
+        GetAdditionalTeesResponse, GetEvidenceRequest, GetEvidenceResponse, GetTeeTypeRequest,
+        GetTeeTypeResponse, GetTokenRequest, GetTokenResponse,
+        attestation_agent_service_server::{
+            AttestationAgentService, AttestationAgentServiceServer,
+        },
+    };
     use protos::challenge;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+    use tonic::{Request, Response, Status};
 
     #[tokio::test]
     async fn file_backed_attester_returns_nonce_as_init_data() -> Result<()> {
@@ -351,24 +389,91 @@ mod tests {
         let err = attester
             .get_evidence(Tee::Tdx, &test_challenge(&[0u8; 65]))
             .await
-            .expect_err("oversized runtime_data should fail before RPC integration");
+            .expect_err("oversized runtime_data should fail before RPC");
 
         assert!(err.to_string().contains("at most 64 bytes"));
     }
 
     #[tokio::test]
-    async fn guest_components_grpc_attester_reports_reserved_boundary() {
-        let attester = GuestComponentsGrpcAttester::new("http://127.0.0.1:50000");
+    async fn guest_components_grpc_attester_extracts_cca_token_from_mock_aa() -> Result<()> {
+        let token = include_bytes!("../../test_data/cca/cca-token.cbor");
+        let body = serde_json::to_vec(&serde_json::json!({ "token": token.as_slice() }))?;
+        let (endpoint, runtime_data_requests) =
+            spawn_mock_aa_server(b"expected-nonce".to_vec(), body).await?;
+        let attester = GuestComponentsGrpcAttester::new(endpoint);
+        let evidence = attester
+            .get_evidence(Tee::Cca, &test_challenge(b"expected-nonce"))
+            .await?;
+
+        assert_eq!(evidence[0].init_data, b"expected-nonce");
+        assert_eq!(evidence[0].runtime_data, token);
+        assert_eq!(
+            *runtime_data_requests.lock().unwrap(),
+            vec![b"expected-nonce".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guest_components_grpc_attester_extracts_tdx_quote_from_mock_aa() -> Result<()> {
+        let quote = include_bytes!("../../test_data/tdx/tdx_quote_4.dat");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "quote": STANDARD.encode(quote),
+        }))?;
+        let (endpoint, runtime_data_requests) =
+            spawn_mock_aa_server(b"expected-nonce".to_vec(), body).await?;
+        let attester = GuestComponentsGrpcAttester::new(endpoint);
+        let evidence = attester
+            .get_evidence(Tee::Tdx, &test_challenge(b"expected-nonce"))
+            .await?;
+
+        assert_eq!(evidence[0].runtime_data, quote);
+        assert_eq!(
+            *runtime_data_requests.lock().unwrap(),
+            vec![b"expected-nonce".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guest_components_grpc_attester_passes_csv_evidence_through_from_mock_aa() -> Result<()>
+    {
+        let csv_evidence = include_bytes!("../../test_data/csv/csv_evidence.json").to_vec();
+        let (endpoint, runtime_data_requests) =
+            spawn_mock_aa_server(b"expected-nonce".to_vec(), csv_evidence.clone()).await?;
+        let attester = GuestComponentsGrpcAttester::new(endpoint);
+        let evidence = attester
+            .get_evidence(Tee::Csv, &test_challenge(b"expected-nonce"))
+            .await?;
+
+        assert_eq!(evidence[0].runtime_data, csv_evidence);
+        assert_eq!(
+            *runtime_data_requests.lock().unwrap(),
+            vec![b"expected-nonce".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guest_components_grpc_attester_reports_rpc_error() -> Result<()> {
+        let (endpoint, runtime_data_requests) =
+            spawn_failing_mock_aa_server(b"expected-nonce".to_vec(), "aa unavailable").await?;
+        let attester = GuestComponentsGrpcAttester::new(endpoint);
         let err = attester
             .get_evidence(Tee::Tdx, &test_challenge(b"expected-nonce"))
             .await
-            .expect_err("gRPC provider is a reserved boundary");
+            .expect_err("gRPC status errors should be reported");
 
         assert!(
             err.to_string()
-                .contains("reserved for direct AA integration")
+                .contains("failed to request guest-components gRPC evidence")
         );
-        assert!(err.to_string().contains("gRPC"));
+        assert!(format!("{err:#}").contains("aa unavailable"));
+        assert_eq!(
+            *runtime_data_requests.lock().unwrap(),
+            vec![b"expected-nonce".to_vec()]
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -501,11 +606,11 @@ mod tests {
     #[test]
     fn guest_components_evidence_normalizer_rejects_unsupported_tee() {
         let err = normalize_guest_components_evidence(Tee::Kunpeng, b"{}")
-            .expect_err("Kunpeng is not supported by guest-components REST adapter");
+            .expect_err("Kunpeng is not supported by guest-components adapter");
 
         assert!(
             err.to_string()
-                .contains("guest-components REST evidence does not support Kunpeng")
+                .contains("guest-components evidence does not support Kunpeng")
         );
     }
 
@@ -515,6 +620,123 @@ mod tests {
             .expect_err("unspecified TEE should fail");
 
         assert!(err.to_string().contains("unsupported tee"));
+    }
+
+    #[derive(Clone)]
+    struct MockAaService {
+        expected_runtime_data: Vec<u8>,
+        evidence: Vec<u8>,
+        error_message: Option<&'static str>,
+        runtime_data_requests: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[tonic::async_trait]
+    impl AttestationAgentService for MockAaService {
+        async fn get_evidence(
+            &self,
+            request: Request<GetEvidenceRequest>,
+        ) -> std::result::Result<Response<GetEvidenceResponse>, Status> {
+            let runtime_data = request.into_inner().runtime_data;
+            self.runtime_data_requests
+                .lock()
+                .unwrap()
+                .push(runtime_data.clone());
+
+            if let Some(message) = self.error_message {
+                return Err(Status::unavailable(message));
+            }
+            if runtime_data != self.expected_runtime_data {
+                return Err(Status::invalid_argument("unexpected runtime_data"));
+            }
+
+            Ok(Response::new(GetEvidenceResponse {
+                evidence: self.evidence.clone(),
+            }))
+        }
+
+        async fn get_additional_evidence(
+            &self,
+            _request: Request<GetAdditionalEvidenceRequest>,
+        ) -> std::result::Result<Response<GetEvidenceResponse>, Status> {
+            Err(Status::unimplemented("not needed by attester tests"))
+        }
+
+        async fn get_token(
+            &self,
+            _request: Request<GetTokenRequest>,
+        ) -> std::result::Result<Response<GetTokenResponse>, Status> {
+            Err(Status::unimplemented("not needed by attester tests"))
+        }
+
+        async fn extend_runtime_measurement(
+            &self,
+            _request: Request<ExtendRuntimeMeasurementRequest>,
+        ) -> std::result::Result<Response<ExtendRuntimeMeasurementResponse>, Status> {
+            Err(Status::unimplemented("not needed by attester tests"))
+        }
+
+        async fn bind_init_data(
+            &self,
+            _request: Request<BindInitDataRequest>,
+        ) -> std::result::Result<Response<BindInitDataResponse>, Status> {
+            Err(Status::unimplemented("not needed by attester tests"))
+        }
+
+        async fn get_tee_type(
+            &self,
+            _request: Request<GetTeeTypeRequest>,
+        ) -> std::result::Result<Response<GetTeeTypeResponse>, Status> {
+            Err(Status::unimplemented("not needed by attester tests"))
+        }
+
+        async fn get_additional_tees(
+            &self,
+            _request: Request<GetAdditionalTeesRequest>,
+        ) -> std::result::Result<Response<GetAdditionalTeesResponse>, Status> {
+            Err(Status::unimplemented("not needed by attester tests"))
+        }
+    }
+
+    async fn spawn_mock_aa_server(
+        expected_runtime_data: Vec<u8>,
+        evidence: Vec<u8>,
+    ) -> Result<(String, Arc<Mutex<Vec<Vec<u8>>>>)> {
+        spawn_mock_aa_server_with_result(expected_runtime_data, evidence, None).await
+    }
+
+    async fn spawn_failing_mock_aa_server(
+        expected_runtime_data: Vec<u8>,
+        message: &'static str,
+    ) -> Result<(String, Arc<Mutex<Vec<Vec<u8>>>>)> {
+        spawn_mock_aa_server_with_result(expected_runtime_data, Vec::new(), Some(message)).await
+    }
+
+    async fn spawn_mock_aa_server_with_result(
+        expected_runtime_data: Vec<u8>,
+        evidence: Vec<u8>,
+        error_message: Option<&'static str>,
+    ) -> Result<(String, Arc<Mutex<Vec<Vec<u8>>>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let runtime_data_requests = Arc::new(Mutex::new(Vec::new()));
+        let service = MockAaService {
+            expected_runtime_data,
+            evidence,
+            error_message,
+            runtime_data_requests: runtime_data_requests.clone(),
+        };
+
+        tokio::spawn(async move {
+            if let Err(err) = Server::builder()
+                .add_service(AttestationAgentServiceServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+            {
+                panic!("mock AA gRPC server failed: {err}");
+            }
+        });
+
+        Ok((format!("http://{addr}"), runtime_data_requests))
     }
 
     fn test_challenge(nonce: &[u8]) -> AttestationChallenge {

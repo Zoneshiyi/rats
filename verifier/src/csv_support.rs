@@ -15,7 +15,7 @@ use crate::config;
 const HSK_CEK_FILENAME: &str = "hsk_cek.cert";
 const ATTESTATION_EXT_MAGIC: [u8; 16] = *b"ATTESTATION_EXT\0";
 const CSV_RTMR_REG_SIZE: usize = 32;
-const HRK: &[u8] = include_bytes!("hrk.cert");
+const HRK: &[u8] = include_bytes!("../../test_certs/hrk.cert");
 
 unsafe extern "C" {
     fn EVP_MD_CTX_set_pkey_ctx(ctx: *mut EVP_MD_CTX, sctx: *mut EVP_PKEY_CTX) -> c_int;
