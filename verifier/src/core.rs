@@ -159,7 +159,7 @@ impl VerifierFactory for DefaultVerifierFactory {
             Tee::Cca => {
                 cfg_if! {
                     if #[cfg(feature = "cca-verifier")] {
-                        Ok(Box::<crate::cca::CCA>::default() as Box<dyn Verifier + Send + Sync>)
+                        Ok(Box::<crate::tee::cca::CCA>::default() as Box<dyn Verifier + Send + Sync>)
                     } else {
                         bail!("feature `cca-verifier` is not enabled for `verifier` crate.")
                     }
@@ -168,7 +168,7 @@ impl VerifierFactory for DefaultVerifierFactory {
             Tee::Tdx => {
                 cfg_if! {
                     if #[cfg(feature = "tdx-verifier")] {
-                        Ok(Box::<crate::tdx::TDX>::default() as Box<dyn Verifier + Send + Sync>)
+                        Ok(Box::<crate::tee::tdx::TDX>::default() as Box<dyn Verifier + Send + Sync>)
                     } else {
                         bail!("feature `tdx-verifier` is not enabled for `verifier` crate.")
                     }
@@ -177,7 +177,7 @@ impl VerifierFactory for DefaultVerifierFactory {
             Tee::Csv => {
                 cfg_if! {
                     if #[cfg(feature = "csv-verifier")] {
-                        Ok(Box::<crate::csv::Csv>::default() as Box<dyn Verifier + Send + Sync>)
+                        Ok(Box::<crate::tee::csv::Csv>::default() as Box<dyn Verifier + Send + Sync>)
                     } else {
                         bail!("feature `csv-verifier` is not enabled for `verifier` crate.")
                     }
@@ -186,7 +186,7 @@ impl VerifierFactory for DefaultVerifierFactory {
             Tee::Kunpeng => {
                 cfg_if! {
                     if #[cfg(feature = "kunpeng-verifier")] {
-                        Ok(Box::<crate::kunpeng::Kunpeng>::default() as Box<dyn Verifier + Send + Sync>)
+                        Ok(Box::<crate::tee::kunpeng::Kunpeng>::default() as Box<dyn Verifier + Send + Sync>)
                     } else {
                         bail!("feature `kunpeng-verifier` is not enabled for `verifier` crate.")
                     }

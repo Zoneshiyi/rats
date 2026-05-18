@@ -1,6 +1,8 @@
-use super::*;
-use ear::{Algorithm, Appraisal, Bytes, Ear, Profile, RawValue, RawValueKind, register_profile};
+use async_trait::async_trait;
+use ear::{Algorithm, Appraisal, Bytes, Profile, RawValue, RawValueKind, register_profile};
 use serde::Deserialize;
+
+use crate::{Result, VerificationContext, Verifier, apply_challenge, config, init_ear};
 
 #[derive(Debug, Default)]
 pub struct Kunpeng {}
@@ -51,7 +53,7 @@ fn parse_evidence(raw_evidence: &[u8]) -> Result<KunpengEvidence> {
     Ok(serde_json::from_slice(raw_evidence)?)
 }
 
-fn gen_ear_token(evidence: &KunpengEvidence) -> Result<Ear> {
+fn gen_ear_token(evidence: &KunpengEvidence) -> Result<crate::Ear> {
     let mut token = init_ear(PROFILE_NAME)?;
 
     let mut appraisal = Appraisal::new_with_profile(PROFILE_NAME)?;
@@ -106,12 +108,14 @@ impl Verifier for Kunpeng {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChallengeTokenClaims;
     use protos::Tee;
 
     #[tokio::test]
     async fn verify() -> Result<()> {
-        let verifier = to_verifier(&Tee::Kunpeng).expect("failed to create Kunpeng verifier");
-        let evidence = include_bytes!("../../test_data/kunpeng/kunpeng_evidence.json");
+        let verifier =
+            crate::to_verifier(&Tee::Kunpeng).expect("failed to create Kunpeng verifier");
+        let evidence = include_bytes!("../../../test_data/kunpeng/kunpeng_evidence.json");
         let challenge = ChallengeTokenClaims {
             tee: Tee::Kunpeng as i32,
             mode: 1,
@@ -122,8 +126,8 @@ mod tests {
         let context = VerificationContext::new(challenge, "file-backed");
 
         let signed_token = verifier.verify(evidence, &context).await?;
-        let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
-        let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
+        let pub_key = include_bytes!("../../../test_certs/server_pubkey.json");
+        let ear = crate::Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
         let token_pretty = serde_json::to_string_pretty(&ear)?;
         println!("verified EAR Token Content (JSON): {}", &token_pretty);
 

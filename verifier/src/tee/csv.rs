@@ -1,12 +1,22 @@
-use super::*;
+mod certs;
+mod evidence;
+mod kds;
+
 use anyhow::Context;
-use ear::{Algorithm, Appraisal, Ear, Profile, RawValue, RawValueKind, register_profile};
+use async_trait::async_trait;
+use ear::{Algorithm, Appraisal, Profile, RawValue, RawValueKind, register_profile};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::csv_support::{
-    CertificateChainSource, CsvEvidenceEnvelope, parse_attestation_report, parse_evidence,
-    policy_to_json, resolve_certificate_chain, trim_null_terminated, verify_certificate_chain,
+use self::certs::{CertificateChainSource, verify_certificate_chain};
+use self::evidence::{
+    CsvEvidenceEnvelope, encode_hex, parse_attestation_report, parse_evidence, policy_to_json,
+    trim_null_terminated,
+};
+use self::kds::resolve_certificate_chain;
+use crate::{
+    ChallengeBindingStatus, Result, VerificationContext, Verifier, apply_appraisal,
+    apply_challenge, config, init_ear, verify_challenge_binding,
 };
 
 #[derive(Debug, Default)]
@@ -141,12 +151,10 @@ async fn normalize_claims(evidence: CsvEvidenceEnvelope) -> Result<CsvClaims> {
             Ok(CsvClaims {
                 version: Some(report.version().to_string()),
                 serial_number,
-                report_data: Some(crate::csv_support::encode_hex(&report_data)),
-                measure: Some(crate::csv_support::encode_hex(&report.tee_info().measure())),
+                report_data: Some(encode_hex(&report_data)),
+                measure: Some(encode_hex(&report.tee_info().measure())),
                 policy_json: Some(policy_to_json(report.tee_info().policy())?),
-                user_pubkey_digest: Some(crate::csv_support::encode_hex(
-                    &report.tee_info().user_pubkey_digest(),
-                )),
+                user_pubkey_digest: Some(encode_hex(&report.tee_info().user_pubkey_digest())),
                 cc_eventlog: evidence.cc_eventlog,
                 evidence_shape: "trustee-reference-json".to_string(),
                 attestation_report_len: raw
@@ -166,7 +174,7 @@ async fn normalize_claims(evidence: CsvEvidenceEnvelope) -> Result<CsvClaims> {
     }
 }
 
-fn gen_ear_token(claims: &CsvClaims) -> Result<Ear> {
+fn gen_ear_token(claims: &CsvClaims) -> Result<crate::Ear> {
     let mut token = init_ear(PROFILE_NAME)?;
 
     let mut appraisal = Appraisal::new_with_profile(PROFILE_NAME)?;
@@ -271,6 +279,7 @@ impl Verifier for Csv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AppraisalPolicy, ChallengeTokenClaims};
     use protos::Tee;
 
     async fn challenge_from_csv_evidence(
@@ -318,15 +327,15 @@ mod tests {
 
     #[tokio::test]
     async fn verify() -> Result<()> {
-        let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
-        let evidence = include_bytes!("../../test_data/csv/csv_evidence.json");
+        let verifier = crate::to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
+        let evidence = include_bytes!("../../../test_data/csv/csv_evidence.json");
         let Some(context) = csv_fixture_context(evidence).await? else {
             return Ok(());
         };
 
         let signed_token = verifier.verify(evidence, &context).await?;
-        let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
-        let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
+        let pub_key = include_bytes!("../../../test_certs/server_pubkey.json");
+        let ear = crate::Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
         let token_pretty = serde_json::to_string_pretty(&ear)?;
         assert!(token_pretty.contains("KPA64911240507"));
         assert!(token_pretty.contains("trustee-reference-json"));
@@ -337,9 +346,9 @@ mod tests {
 
     #[tokio::test]
     async fn reject_tampered_pek_signature() -> Result<()> {
-        let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
+        let verifier = crate::to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
         let mut evidence: Value =
-            serde_json::from_slice(include_bytes!("../../test_data/csv/csv_evidence.json"))
+            serde_json::from_slice(include_bytes!("../../../test_data/csv/csv_evidence.json"))
                 .expect("failed to parse csv evidence");
         let r0 = evidence
             .pointer("/cert_chain/pek/sigs/0/signature/r/0")
@@ -350,7 +359,7 @@ mod tests {
             .expect("missing mutable PEK signature byte") = serde_json::json!((r0 + 1) % 255);
 
         let Some(context) =
-            csv_fixture_context(include_bytes!("../../test_data/csv/csv_evidence.json")).await?
+            csv_fixture_context(include_bytes!("../../../test_data/csv/csv_evidence.json")).await?
         else {
             return Ok(());
         };
@@ -367,8 +376,8 @@ mod tests {
 
     #[tokio::test]
     async fn reject_challenge_mismatch() -> Result<()> {
-        let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
-        let evidence = include_bytes!("../../test_data/csv/csv_evidence.json");
+        let verifier = crate::to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
+        let evidence = include_bytes!("../../../test_data/csv/csv_evidence.json");
         if csv_fixture_context(evidence).await?.is_none() {
             return Ok(());
         }
@@ -395,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn simplified_csv_policy_accepts_allowed_measurement() -> Result<()> {
-        let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
+        let verifier = crate::to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
         let evidence = simplified_csv_evidence("abc123")?;
         let challenge = ChallengeTokenClaims {
             tee: Tee::Csv as i32,
@@ -414,8 +423,8 @@ csv_allowed_measurements = ["abc123"]
             VerificationContext::new(challenge, "file-backed").with_appraisal_policy(policy);
 
         let signed_token = verifier.verify(&evidence, &context).await?;
-        let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
-        let mut ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
+        let pub_key = include_bytes!("../../../test_certs/server_pubkey.json");
+        let mut ear = crate::Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
         ear.extensions
             .register("rats.appraisal_policy_id", -70003, RawValueKind::String)?;
         ear.extensions
@@ -434,7 +443,7 @@ csv_allowed_measurements = ["abc123"]
 
     #[tokio::test]
     async fn simplified_csv_policy_rejects_unexpected_measurement() -> Result<()> {
-        let verifier = to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
+        let verifier = crate::to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
         let evidence = simplified_csv_evidence("unexpected")?;
         let challenge = ChallengeTokenClaims {
             tee: Tee::Csv as i32,

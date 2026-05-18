@@ -1,8 +1,13 @@
-use super::*;
+use async_trait::async_trait;
 // use dcap_qvl::PHALA_PCCS_URL;
 // use dcap_qvl::collateral::get_collateral;
-use ear::{Algorithm, Appraisal, Bytes, Ear, Profile, RawValue, RawValueKind, register_profile};
+use ear::{Algorithm, Appraisal, Bytes, Profile, RawValue, RawValueKind, register_profile};
 use tdx_quote::Quote;
+
+use crate::{
+    Result, VerificationContext, Verifier, apply_challenge, config, init_ear,
+    verify_challenge_binding,
+};
 
 #[derive(Debug, Default)]
 pub struct TDX {}
@@ -57,7 +62,7 @@ fn check_quote(raw_evidence: &[u8]) -> Result<Quote> {
     Ok(quote)
 }
 
-fn gen_ear_token(quote: &Quote) -> Result<Ear> {
+fn gen_ear_token(quote: &Quote) -> Result<crate::Ear> {
     let mut token = init_ear(PROFILE_NAME)?;
 
     let mut appraisal = Appraisal::new_with_profile(PROFILE_NAME)?;
@@ -118,6 +123,7 @@ impl Verifier for TDX {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChallengeTokenClaims;
     use protos::Tee;
 
     fn challenge_from_report_data(tee: Tee, report_data: &[u8]) -> Result<ChallengeTokenClaims> {
@@ -128,16 +134,16 @@ mod tests {
 
     #[tokio::test]
     async fn verify() -> Result<()> {
-        let verifier = to_verifier(&Tee::Tdx).expect("failed to create TDX verifier");
-        let quote = include_bytes!("../../test_data/tdx/tdx_quote_4.dat");
+        let verifier = crate::to_verifier(&Tee::Tdx).expect("failed to create TDX verifier");
+        let quote = include_bytes!("../../../test_data/tdx/tdx_quote_4.dat");
         let parsed_quote = check_quote(quote)?;
         let challenge = challenge_from_report_data(Tee::Tdx, &parsed_quote.report_input_data())?;
         let context = VerificationContext::new(challenge, "file-backed");
 
         let signed_token = verifier.verify(quote, &context).await?;
 
-        let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
-        let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
+        let pub_key = include_bytes!("../../../test_certs/server_pubkey.json");
+        let ear = crate::Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
         let token_pretty = serde_json::to_string_pretty(&ear)?;
         println!("verified EAR Token Content (JSON): {}", &token_pretty);
 
@@ -146,8 +152,8 @@ mod tests {
 
     #[tokio::test]
     async fn reject_challenge_mismatch() -> Result<()> {
-        let verifier = to_verifier(&Tee::Tdx).expect("failed to create TDX verifier");
-        let quote = include_bytes!("../../test_data/tdx/tdx_quote_4.dat");
+        let verifier = crate::to_verifier(&Tee::Tdx).expect("failed to create TDX verifier");
+        let quote = include_bytes!("../../../test_data/tdx/tdx_quote_4.dat");
         let challenge = challenge_from_report_data(Tee::Tdx, b"mismatched-tdx-nonce")?;
         let context = VerificationContext::new(challenge, "file-backed");
 

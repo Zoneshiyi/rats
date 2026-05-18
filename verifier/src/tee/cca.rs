@@ -1,7 +1,12 @@
-use super::*;
 use anyhow::anyhow;
+use async_trait::async_trait;
 use ccatoken::{store, token::Evidence};
 use ear::{Algorithm, Appraisal, Bytes, Profile, RawValue, RawValueKind, register_profile};
+
+use crate::{
+    Result, VerificationContext, Verifier, apply_challenge, config, init_ear,
+    verify_challenge_binding,
+};
 
 #[derive(Debug, Default)]
 pub struct CCA {}
@@ -35,7 +40,7 @@ fn check_evidence(e: &mut Evidence) -> Result<()> {
     Ok(())
 }
 
-fn gen_ear_token(e: &Evidence) -> Result<Ear> {
+fn gen_ear_token(e: &Evidence) -> Result<crate::Ear> {
     let (platform_tvec, realm_tvec) = e.get_trust_vectors();
 
     let mut token = init_ear(PROFILE_NAME)?;
@@ -97,6 +102,7 @@ impl Verifier for CCA {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChallengeTokenClaims;
     use protos::Tee;
 
     fn challenge_from_report_data(tee: Tee, report_data: &[u8]) -> Result<ChallengeTokenClaims> {
@@ -107,15 +113,15 @@ mod tests {
 
     #[tokio::test]
     async fn verify() -> Result<()> {
-        let verifier = to_verifier(&Tee::Cca).expect("failed to create CCA verifier");
-        let token = include_bytes!("../../test_data/cca/cca-token.cbor");
+        let verifier = crate::to_verifier(&Tee::Cca).expect("failed to create CCA verifier");
+        let token = include_bytes!("../../../test_data/cca/cca-token.cbor");
         let evidence = Evidence::decode(&token.to_vec()).expect("decoding CCA token");
         let challenge = challenge_from_report_data(Tee::Cca, &evidence.realm_claims.challenge)?;
         let context = VerificationContext::new(challenge, "file-backed");
         let signed_token = verifier.verify(token, &context).await?;
 
-        let pub_key = include_bytes!("../../test_certs/server_pubkey.json");
-        let ear = Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
+        let pub_key = include_bytes!("../../../test_certs/server_pubkey.json");
+        let ear = crate::Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
         let token_pretty = serde_json::to_string_pretty(&ear)?;
         println!("verified EAR Token Content (JSON): {}", &token_pretty);
 
@@ -124,8 +130,8 @@ mod tests {
 
     #[tokio::test]
     async fn reject_challenge_mismatch() -> Result<()> {
-        let verifier = to_verifier(&Tee::Cca).expect("failed to create CCA verifier");
-        let token = include_bytes!("../../test_data/cca/cca-token.cbor");
+        let verifier = crate::to_verifier(&Tee::Cca).expect("failed to create CCA verifier");
+        let token = include_bytes!("../../../test_data/cca/cca-token.cbor");
         let challenge = challenge_from_report_data(Tee::Cca, b"mismatched-cca-nonce")?;
         let context = VerificationContext::new(challenge, "file-backed");
 
@@ -142,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_evidence_returns_error() -> Result<()> {
-        let verifier = to_verifier(&Tee::Cca).expect("failed to create CCA verifier");
+        let verifier = crate::to_verifier(&Tee::Cca).expect("failed to create CCA verifier");
         let challenge = challenge_from_report_data(Tee::Cca, b"expected-cca-nonce")?;
         let context = VerificationContext::new(challenge, "file-backed");
 
