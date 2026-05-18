@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use protos::{Mode, Tee};
 use std::sync::Arc;
+use tracing::{info, warn};
 
 use crate::core::{AttestationChallenge, Attester, AttesterEvidence, decode_attestation_challenge};
 
@@ -130,14 +131,39 @@ impl AttesterApplicationService {
         requested_nonce: Vec<u8>,
     ) -> std::result::Result<IssuedChallenge, ServiceError> {
         if mode == Mode::Unspecified {
+            warn!(tee = ?self.tee, mode = ?mode, "rejected challenge request");
             return Err(ServiceError::invalid_argument("unsupported mode"));
         }
 
-        let (nonce, challenge_token) = self
+        info!(
+            tee = ?self.tee,
+            mode = ?mode,
+            requested_nonce_len = requested_nonce.len(),
+            "requesting verifier challenge"
+        );
+        let (nonce, challenge_token) = match self
             .verifier_gateway
             .issue_challenge(self.tee, mode, &requested_nonce)
             .await
-            .map_err(|err| ServiceError::internal(err.to_string()))?;
+        {
+            Ok(challenge) => challenge,
+            Err(err) => {
+                warn!(
+                    tee = ?self.tee,
+                    mode = ?mode,
+                    error = %err,
+                    "failed to issue verifier challenge"
+                );
+                return Err(ServiceError::internal(err.to_string()));
+            }
+        };
+        info!(
+            tee = ?self.tee,
+            mode = ?mode,
+            nonce_len = nonce.len(),
+            challenge_token_len = challenge_token.len(),
+            "issued verifier challenge"
+        );
 
         Ok(IssuedChallenge {
             nonce,
@@ -151,18 +177,41 @@ impl AttesterApplicationService {
         challenge_token: Vec<u8>,
     ) -> std::result::Result<AttestationOutcome, ServiceError> {
         let challenge = self.decode_challenge(Some(mode as i32), &challenge_token)?;
-        let evidence = self
-            .attester
-            .get_evidence(self.tee, &challenge)
-            .await
-            .map_err(|err| ServiceError::internal(err.to_string()))?;
+        info!(
+            tee = ?self.tee,
+            mode = ?challenge.mode,
+            evidence_source = %self.evidence_source,
+            runtime_data_len = challenge.nonce.len(),
+            "collecting attestation evidence"
+        );
+        let evidence = match self.attester.get_evidence(self.tee, &challenge).await {
+            Ok(evidence) => evidence,
+            Err(err) => {
+                warn!(
+                    tee = ?self.tee,
+                    mode = ?challenge.mode,
+                    evidence_source = %self.evidence_source,
+                    error = %err,
+                    "failed to collect attestation evidence"
+                );
+                return Err(ServiceError::internal(err.to_string()));
+            }
+        };
+        info!(
+            tee = ?self.tee,
+            mode = ?challenge.mode,
+            evidence_source = %self.evidence_source,
+            evidence_count = evidence.len(),
+            first_evidence_len = ?evidence.first().map(|evidence| evidence.runtime_data.len()),
+            "collected attestation evidence"
+        );
 
         match challenge.mode {
             Mode::Passport => {
                 let raw = evidence
                     .first()
                     .ok_or_else(|| ServiceError::internal("missing evidence"))?;
-                let token = self
+                let token = match self
                     .verifier_gateway
                     .verify(
                         self.tee,
@@ -171,11 +220,42 @@ impl AttesterApplicationService {
                         &self.evidence_source,
                     )
                     .await
-                    .map_err(|err| ServiceError::internal(err.to_string()))?;
+                {
+                    Ok(token) => token,
+                    Err(err) => {
+                        warn!(
+                            tee = ?self.tee,
+                            mode = ?challenge.mode,
+                            evidence_source = %self.evidence_source,
+                            evidence_len = raw.runtime_data.len(),
+                            error = %err,
+                            "passport verification failed"
+                        );
+                        return Err(ServiceError::internal(err.to_string()));
+                    }
+                };
+                info!(
+                    tee = ?self.tee,
+                    mode = ?challenge.mode,
+                    evidence_source = %self.evidence_source,
+                    attestation_token_len = token.len(),
+                    "passport verification accepted"
+                );
                 Ok(AttestationOutcome::AttestationToken(token.into_bytes()))
             }
-            Mode::BackgroundCheck | Mode::Mix => Ok(AttestationOutcome::EvidenceList(evidence)),
-            Mode::Unspecified => Err(ServiceError::unsupported_mode("unsupported mode")),
+            Mode::BackgroundCheck | Mode::Mix => {
+                info!(
+                    tee = ?self.tee,
+                    mode = ?challenge.mode,
+                    evidence_source = %self.evidence_source,
+                    "returning evidence list for deferred verification"
+                );
+                Ok(AttestationOutcome::EvidenceList(evidence))
+            }
+            Mode::Unspecified => {
+                warn!(tee = ?self.tee, mode = ?challenge.mode, "rejected unsupported mode");
+                Err(ServiceError::unsupported_mode("unsupported mode"))
+            }
         }
     }
 
@@ -189,7 +269,13 @@ impl AttesterApplicationService {
             .first()
             .ok_or_else(|| ServiceError::invalid_argument("missing evidence"))?;
 
-        let token = self
+        info!(
+            tee = ?self.tee,
+            evidence_source = %self.evidence_source,
+            evidence_len = evidence.runtime_data.len(),
+            "requesting verifier evaluation"
+        );
+        let token = match self
             .verifier_gateway
             .verify(
                 self.tee,
@@ -198,7 +284,25 @@ impl AttesterApplicationService {
                 &self.evidence_source,
             )
             .await
-            .map_err(|err| ServiceError::internal(err.to_string()))?;
+        {
+            Ok(token) => token,
+            Err(err) => {
+                warn!(
+                    tee = ?self.tee,
+                    evidence_source = %self.evidence_source,
+                    evidence_len = evidence.runtime_data.len(),
+                    error = %err,
+                    "verifier evaluation failed"
+                );
+                return Err(ServiceError::internal(err.to_string()));
+            }
+        };
+        info!(
+            tee = ?self.tee,
+            evidence_source = %self.evidence_source,
+            attestation_token_len = token.len(),
+            "verifier evaluation accepted"
+        );
 
         Ok(VerificationResult {
             attestation_token: token.into_bytes(),

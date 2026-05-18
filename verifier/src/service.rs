@@ -2,6 +2,7 @@ use anyhow::Result;
 use protos::Tee;
 use protos::challenge::{self, ChallengeTokenClaims};
 use std::sync::Arc;
+use tracing::{info, warn};
 
 use crate::config::VerifierConfig;
 use crate::core::{AppraisalPolicy, DefaultVerifierFactory, VerificationContext, VerifierFactory};
@@ -84,6 +85,33 @@ impl AuditEvent {
             challenge_id: context.challenge_id(),
             evidence_source: context.evidence_source().to_string(),
             reason: Some(reason.into()),
+        }
+    }
+}
+
+fn record_audit_event(event: &AuditEvent) {
+    match event.kind {
+        AuditEventKind::ChallengeIssued | AuditEventKind::VerificationAccepted => {
+            info!(
+                audit.kind = ?event.kind,
+                tee = ?event.tee,
+                mode = event.mode,
+                challenge_id = %event.challenge_id,
+                evidence_source = %event.evidence_source,
+                reason = ?event.reason,
+                "audit event"
+            );
+        }
+        AuditEventKind::VerificationRejected => {
+            warn!(
+                audit.kind = ?event.kind,
+                tee = ?event.tee,
+                mode = event.mode,
+                challenge_id = %event.challenge_id,
+                evidence_source = %event.evidence_source,
+                reason = ?event.reason,
+                "audit event"
+            );
         }
     }
 }
@@ -220,27 +248,72 @@ impl VerifierApplicationService {
         input: IssueChallengeInput,
     ) -> std::result::Result<IssuedChallenge, ServiceError> {
         if input.tee == Tee::Unspecified {
+            warn!(tee = ?input.tee, mode = input.mode, "rejected challenge request");
             return Err(ServiceError::invalid_argument("unsupported tee"));
         }
         if input.mode == 0 {
+            warn!(tee = ?input.tee, mode = input.mode, "rejected challenge request");
             return Err(ServiceError::invalid_argument("unsupported mode"));
         }
         if !input.requested_nonce.is_empty() && !self.config.allow_test_nonce {
+            warn!(
+                tee = ?input.tee,
+                mode = input.mode,
+                requested_nonce_len = input.requested_nonce.len(),
+                "rejected custom nonce challenge request"
+            );
             return Err(ServiceError::invalid_argument("custom nonce is disabled"));
         }
 
         let requested_nonce =
             (!input.requested_nonce.is_empty()).then_some(input.requested_nonce.as_slice());
-        let (nonce, challenge_token) = self
-            .challenge_tokens
-            .issue(
-                input.tee as i32,
-                input.mode,
-                requested_nonce,
-                self.config.challenge_ttl_secs,
-                &self.config.challenge_signing_key,
-            )
-            .map_err(|err| ServiceError::internal(err.to_string()))?;
+        info!(
+            tee = ?input.tee,
+            mode = input.mode,
+            requested_nonce_len = input.requested_nonce.len(),
+            ttl_secs = self.config.challenge_ttl_secs,
+            "issuing challenge"
+        );
+        let (nonce, challenge_token) = match self.challenge_tokens.issue(
+            input.tee as i32,
+            input.mode,
+            requested_nonce,
+            self.config.challenge_ttl_secs,
+            &self.config.challenge_signing_key,
+        ) {
+            Ok(challenge) => challenge,
+            Err(err) => {
+                warn!(
+                    tee = ?input.tee,
+                    mode = input.mode,
+                    error = %err,
+                    "failed to issue challenge"
+                );
+                return Err(ServiceError::internal(err.to_string()));
+            }
+        };
+        match challenge::decode(&challenge_token) {
+            Ok(claims) => {
+                let event = AuditEvent::challenge_issued(input.tee, &claims);
+                record_audit_event(&event);
+            }
+            Err(err) => {
+                warn!(
+                    tee = ?input.tee,
+                    mode = input.mode,
+                    challenge_token_len = challenge_token.len(),
+                    error = %err,
+                    "issued challenge token could not be decoded for audit logging"
+                );
+            }
+        }
+        info!(
+            tee = ?input.tee,
+            mode = input.mode,
+            nonce_len = nonce.len(),
+            challenge_token_len = challenge_token.len(),
+            "challenge issued"
+        );
 
         Ok(IssuedChallenge {
             nonce,
@@ -253,33 +326,82 @@ impl VerifierApplicationService {
         input: VerifyEvidenceInput,
     ) -> std::result::Result<VerifiedToken, ServiceError> {
         if input.tee == Tee::Unspecified {
+            warn!(
+                tee = ?input.tee,
+                evidence_source = %input.evidence_source,
+                evidence_len = input.evidence.len(),
+                "rejected verification request"
+            );
             return Err(ServiceError::invalid_argument("unsupported tee"));
         }
 
-        let challenge = self
-            .challenge_tokens
-            .verify(
-                &input.challenge_token,
-                Some(input.tee as i32),
-                None,
-                &self.config.challenge_signing_key,
-            )
-            .map_err(|err| ServiceError::invalid_argument(err.to_string()))?;
+        info!(
+            tee = ?input.tee,
+            evidence_source = %input.evidence_source,
+            evidence_len = input.evidence.len(),
+            challenge_token_len = input.challenge_token.len(),
+            "verifying evidence"
+        );
+        let challenge = match self.challenge_tokens.verify(
+            &input.challenge_token,
+            Some(input.tee as i32),
+            None,
+            &self.config.challenge_signing_key,
+        ) {
+            Ok(challenge) => challenge,
+            Err(err) => {
+                warn!(
+                    tee = ?input.tee,
+                    evidence_source = %input.evidence_source,
+                    evidence_len = input.evidence.len(),
+                    error = %err,
+                    "rejected verification request with invalid challenge"
+                );
+                return Err(ServiceError::invalid_argument(err.to_string()));
+            }
+        };
+        let challenge_id = challenge.challenge_id();
 
-        let verifier = self
-            .verifier_factory
-            .resolve(input.tee)
-            .map_err(|err| ServiceError::internal(err.to_string()))?;
+        let verifier = match self.verifier_factory.resolve(input.tee) {
+            Ok(verifier) => verifier,
+            Err(err) => {
+                warn!(
+                    tee = ?input.tee,
+                    evidence_source = %input.evidence_source,
+                    challenge_id = %challenge_id,
+                    error = %err,
+                    "failed to resolve verifier"
+                );
+                return Err(ServiceError::internal(err.to_string()));
+            }
+        };
         let context = VerificationContext::new(challenge, input.evidence_source)
             .with_appraisal_policy(self.config.appraisal_policy.clone());
         let token = match verifier.verify(&input.evidence, &context).await {
             Ok(token) => {
-                let _event = AuditEvent::verification_accepted(input.tee, &context);
+                let event = AuditEvent::verification_accepted(input.tee, &context);
+                record_audit_event(&event);
+                info!(
+                    tee = ?input.tee,
+                    evidence_source = context.evidence_source(),
+                    challenge_id = %context.challenge_id(),
+                    evidence_len = input.evidence.len(),
+                    attestation_token_len = token.len(),
+                    "verification accepted"
+                );
                 token
             }
             Err(err) => {
-                let _event =
-                    AuditEvent::verification_rejected(input.tee, &context, err.to_string());
+                let event = AuditEvent::verification_rejected(input.tee, &context, err.to_string());
+                record_audit_event(&event);
+                warn!(
+                    tee = ?input.tee,
+                    evidence_source = context.evidence_source(),
+                    challenge_id = %context.challenge_id(),
+                    evidence_len = input.evidence.len(),
+                    error = %err,
+                    "verification rejected"
+                );
                 return Err(ServiceError::internal(err.to_string()));
             }
         };

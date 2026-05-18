@@ -9,6 +9,7 @@ use protos::challenge::decode as decode_challenge_token;
 use protos::{Evidence, Mode, Tee};
 use serde::Deserialize;
 use tokio::fs;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttesterEvidence {
@@ -127,29 +128,78 @@ impl Attester for GuestComponentsGrpcAttester {
         tee: Tee,
         challenge: &AttestationChallenge,
     ) -> Result<Vec<AttesterEvidence>> {
-        validate_aa_runtime_data(&challenge.nonce)?;
+        if let Err(err) = validate_aa_runtime_data(&challenge.nonce) {
+            warn!(
+                tee = ?tee,
+                runtime_data_len = challenge.nonce.len(),
+                error = %err,
+                "rejected guest-components gRPC runtime data"
+            );
+            return Err(err);
+        }
 
-        let mut client = AttestationAgentServiceClient::connect(self.endpoint.clone())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to connect to guest-components AA at {}",
-                    self.endpoint
-                )
-            })?;
-        let response = client
+        info!(
+            tee = ?tee,
+            endpoint = %self.endpoint,
+            runtime_data_len = challenge.nonce.len(),
+            "requesting guest-components gRPC evidence"
+        );
+        let connect_result = AttestationAgentServiceClient::connect(self.endpoint.clone()).await;
+        if let Err(err) = &connect_result {
+            warn!(
+                tee = ?tee,
+                endpoint = %self.endpoint,
+                error = %err,
+                "failed to connect to guest-components AA"
+            );
+        }
+        let mut client = connect_result.with_context(|| {
+            format!(
+                "failed to connect to guest-components AA at {}",
+                self.endpoint
+            )
+        })?;
+        let response_result = client
             .get_evidence(GetEvidenceRequest {
                 runtime_data: challenge.nonce.clone(),
             })
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to request guest-components gRPC evidence from {}",
-                    self.endpoint
-                )
-            })?;
-        let runtime_data =
-            normalize_guest_components_evidence(tee, &response.into_inner().evidence)?;
+            .await;
+        if let Err(err) = &response_result {
+            warn!(
+                tee = ?tee,
+                endpoint = %self.endpoint,
+                error = %err,
+                "guest-components gRPC evidence request failed"
+            );
+        }
+        let response = response_result.with_context(|| {
+            format!(
+                "failed to request guest-components gRPC evidence from {}",
+                self.endpoint
+            )
+        })?;
+        let evidence = response.into_inner().evidence;
+        let raw_evidence_len = evidence.len();
+        let runtime_data = match normalize_guest_components_evidence(tee, &evidence) {
+            Ok(runtime_data) => runtime_data,
+            Err(err) => {
+                warn!(
+                    tee = ?tee,
+                    endpoint = %self.endpoint,
+                    raw_evidence_len,
+                    error = %err,
+                    "failed to normalize guest-components gRPC evidence"
+                );
+                return Err(err);
+            }
+        };
+        info!(
+            tee = ?tee,
+            endpoint = %self.endpoint,
+            raw_evidence_len,
+            normalized_evidence_len = runtime_data.len(),
+            "received guest-components gRPC evidence"
+        );
         Ok(vec![AttesterEvidence {
             init_data: challenge.nonce.clone(),
             runtime_data,
@@ -167,32 +217,81 @@ impl Attester for GuestComponentsRestAttester {
         let runtime_data = std::str::from_utf8(&challenge.nonce).context(
             "guest-components REST evidence requires a UTF-8 challenge nonce; use the default challenge or an ASCII --nonce",
         )?;
-        let response = self
+        info!(
+            tee = ?tee,
+            url = %self.evidence_url,
+            runtime_data_len = challenge.nonce.len(),
+            "requesting guest-components REST evidence"
+        );
+        let response_result = self
             .client
             .get(&self.evidence_url)
             .query(&[("runtime_data", runtime_data)])
             .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to request guest-components evidence from {}",
-                    self.evidence_url
-                )
-            })?;
+            .await;
+        if let Err(err) = &response_result {
+            warn!(
+                tee = ?tee,
+                url = %self.evidence_url,
+                error = %err,
+                "guest-components REST evidence request failed"
+            );
+        }
+        let response = response_result.with_context(|| {
+            format!(
+                "failed to request guest-components evidence from {}",
+                self.evidence_url
+            )
+        })?;
         let status = response.status();
-        let body = response
-            .bytes()
-            .await
+        let body_result = response.bytes().await;
+        if let Err(err) = &body_result {
+            warn!(
+                tee = ?tee,
+                url = %self.evidence_url,
+                status = %status,
+                error = %err,
+                "failed to read guest-components REST evidence response"
+            );
+        }
+        let body = body_result
             .context("failed to read guest-components evidence response")?
             .to_vec();
         if !status.is_success() {
+            warn!(
+                tee = ?tee,
+                url = %self.evidence_url,
+                status = %status,
+                body_len = body.len(),
+                "guest-components REST evidence request returned non-success status"
+            );
             bail!(
                 "guest-components evidence request failed with {status}: {}",
                 String::from_utf8_lossy(&body)
             );
         }
 
-        let runtime_data = normalize_guest_components_evidence(tee, &body)?;
+        let raw_evidence_len = body.len();
+        let runtime_data = match normalize_guest_components_evidence(tee, &body) {
+            Ok(runtime_data) => runtime_data,
+            Err(err) => {
+                warn!(
+                    tee = ?tee,
+                    url = %self.evidence_url,
+                    raw_evidence_len,
+                    error = %err,
+                    "failed to normalize guest-components REST evidence"
+                );
+                return Err(err);
+            }
+        };
+        info!(
+            tee = ?tee,
+            url = %self.evidence_url,
+            raw_evidence_len,
+            normalized_evidence_len = runtime_data.len(),
+            "received guest-components REST evidence"
+        );
         Ok(vec![AttesterEvidence {
             init_data: challenge.nonce.clone(),
             runtime_data,
