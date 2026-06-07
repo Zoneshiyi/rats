@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use protos::verifier_service_server::{VerifierService, VerifierServiceServer};
 use protos::{
-    ErrorCode, Mode, Tee, VerifierChallengeRequest, VerifierChallengeResponse, VerifierRequest,
-    VerifierResponse,
+    ErrorCode, EvidenceSource, Mode, Tee, VerifierChallengeRequest, VerifierChallengeResponse,
+    VerifierRequest, VerifierResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -57,7 +57,8 @@ impl VerifierService for GrpcVerifierService {
                 tee: Tee::try_from(req.tee).unwrap_or(Tee::Unspecified),
                 evidence: req.evidence,
                 challenge_token: req.challenge_token,
-                evidence_source: req.evidence_source,
+                evidence_source: EvidenceSource::try_from(req.evidence_source)
+                    .unwrap_or(EvidenceSource::Unspecified),
             })
             .await
             .map_err(map_service_error)?;

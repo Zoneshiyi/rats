@@ -10,7 +10,6 @@ use protos::{Evidence, Mode, Tee};
 use serde::Deserialize;
 use tokio::fs;
 use tracing::{info, warn};
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttesterEvidence {
     pub init_data: Vec<u8>,
@@ -90,21 +89,6 @@ impl Attester for FileBackedAttester {
             init_data: challenge.nonce.clone(),
             runtime_data,
         }])
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct GuestComponentsRestAttester {
-    evidence_url: String,
-    client: reqwest::Client,
-}
-
-impl GuestComponentsRestAttester {
-    pub fn new(evidence_url: impl Into<String>) -> Self {
-        Self {
-            evidence_url: normalize_evidence_url(evidence_url.into()),
-            client: reqwest::Client::new(),
-        }
     }
 }
 
@@ -207,98 +191,6 @@ impl Attester for GuestComponentsGrpcAttester {
     }
 }
 
-#[async_trait]
-impl Attester for GuestComponentsRestAttester {
-    async fn get_evidence(
-        &self,
-        tee: Tee,
-        challenge: &AttestationChallenge,
-    ) -> Result<Vec<AttesterEvidence>> {
-        let runtime_data = std::str::from_utf8(&challenge.nonce).context(
-            "guest-components REST evidence requires a UTF-8 challenge nonce; use the default challenge or an ASCII --nonce",
-        )?;
-        info!(
-            tee = ?tee,
-            url = %self.evidence_url,
-            runtime_data_len = challenge.nonce.len(),
-            "requesting guest-components REST evidence"
-        );
-        let response_result = self
-            .client
-            .get(&self.evidence_url)
-            .query(&[("runtime_data", runtime_data)])
-            .send()
-            .await;
-        if let Err(err) = &response_result {
-            warn!(
-                tee = ?tee,
-                url = %self.evidence_url,
-                error = %err,
-                "guest-components REST evidence request failed"
-            );
-        }
-        let response = response_result.with_context(|| {
-            format!(
-                "failed to request guest-components evidence from {}",
-                self.evidence_url
-            )
-        })?;
-        let status = response.status();
-        let body_result = response.bytes().await;
-        if let Err(err) = &body_result {
-            warn!(
-                tee = ?tee,
-                url = %self.evidence_url,
-                status = %status,
-                error = %err,
-                "failed to read guest-components REST evidence response"
-            );
-        }
-        let body = body_result
-            .context("failed to read guest-components evidence response")?
-            .to_vec();
-        if !status.is_success() {
-            warn!(
-                tee = ?tee,
-                url = %self.evidence_url,
-                status = %status,
-                body_len = body.len(),
-                "guest-components REST evidence request returned non-success status"
-            );
-            bail!(
-                "guest-components evidence request failed with {status}: {}",
-                String::from_utf8_lossy(&body)
-            );
-        }
-
-        let raw_evidence_len = body.len();
-        let runtime_data = match normalize_guest_components_evidence(tee, &body) {
-            Ok(runtime_data) => runtime_data,
-            Err(err) => {
-                warn!(
-                    tee = ?tee,
-                    url = %self.evidence_url,
-                    raw_evidence_len,
-                    error = %err,
-                    "failed to normalize guest-components REST evidence"
-                );
-                return Err(err);
-            }
-        };
-        info!(
-            tee = ?tee,
-            url = %self.evidence_url,
-            raw_evidence_len,
-            normalized_evidence_len = runtime_data.len(),
-            "received guest-components REST evidence"
-        );
-        Ok(vec![AttesterEvidence {
-            init_data: challenge.nonce.clone(),
-            runtime_data,
-        }])
-    }
-}
-
 fn validate_aa_runtime_data(runtime_data: &[u8]) -> Result<()> {
     if runtime_data.len() > 64 {
         bail!(
@@ -306,15 +198,6 @@ fn validate_aa_runtime_data(runtime_data: &[u8]) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn normalize_evidence_url(raw: String) -> String {
-    let trimmed = raw.trim_end_matches('/');
-    if trimmed.ends_with("/aa/evidence") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/aa/evidence")
-    }
 }
 
 fn normalize_guest_components_evidence(tee: Tee, raw: &[u8]) -> Result<Vec<u8>> {
@@ -408,7 +291,6 @@ mod tests {
     };
     use protos::challenge;
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
@@ -459,26 +341,6 @@ mod tests {
         let err = decode_attestation_challenge(Tee::Tdx, Some(Mode::Passport as i32), &token)
             .expect_err("tee mismatch should fail");
         assert!(err.to_string().contains("tee mismatch"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guest_components_rest_attester_extracts_cca_token_fixture() -> Result<()> {
-        let token = include_bytes!("../../test_data/cca/cca-token.cbor");
-        let body = serde_json::to_vec(&serde_json::json!({ "token": token.as_slice() }))?;
-        let (url, request) = spawn_evidence_server(body).await?;
-        let attester = GuestComponentsRestAttester::new(url);
-        let evidence = attester
-            .get_evidence(Tee::Cca, &test_challenge(b"expected-nonce"))
-            .await?;
-
-        assert_eq!(evidence[0].init_data, b"expected-nonce");
-        assert_eq!(evidence[0].runtime_data, token);
-        assert!(
-            request
-                .await??
-                .contains("GET /aa/evidence?runtime_data=expected-nonce ")
-        );
         Ok(())
     }
 
@@ -572,133 +434,6 @@ mod tests {
             *runtime_data_requests.lock().unwrap(),
             vec![b"expected-nonce".to_vec()]
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guest_components_rest_attester_extracts_cca_base64_token() -> Result<()> {
-        let token = include_bytes!("../../test_data/cca/cca-token.cbor");
-        let body = serde_json::to_vec(&serde_json::json!({
-            "token": STANDARD.encode(token),
-        }))?;
-        let (url, _request) = spawn_evidence_server(body).await?;
-        let attester = GuestComponentsRestAttester::new(url);
-        let evidence = attester
-            .get_evidence(Tee::Cca, &test_challenge(b"expected-nonce"))
-            .await?;
-
-        assert_eq!(evidence[0].runtime_data, token);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guest_components_rest_attester_extracts_tdx_quote_fixture() -> Result<()> {
-        let quote = include_bytes!("../../test_data/tdx/tdx_quote_4.dat");
-        let body = serde_json::to_vec(&serde_json::json!({
-            "quote": STANDARD.encode(quote),
-        }))?;
-        let (url, _request) = spawn_evidence_server(body).await?;
-        let attester = GuestComponentsRestAttester::new(url);
-        let evidence = attester
-            .get_evidence(Tee::Tdx, &test_challenge(b"expected-nonce"))
-            .await?;
-
-        assert_eq!(evidence[0].runtime_data, quote);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guest_components_rest_attester_passes_csv_evidence_through() -> Result<()> {
-        let csv_evidence = include_bytes!("../../test_data/csv/csv_evidence.json");
-        let (url, _request) = spawn_evidence_server(csv_evidence.to_vec()).await?;
-        let attester = GuestComponentsRestAttester::new(url);
-        let evidence = attester
-            .get_evidence(Tee::Csv, &test_challenge(b"expected-nonce"))
-            .await?;
-
-        assert_eq!(evidence[0].runtime_data, csv_evidence);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guest_components_rest_attester_accepts_api_root_url() -> Result<()> {
-        let (url, request) = spawn_evidence_server(br#"{"quote":"AQIDBA=="}"#.to_vec()).await?;
-        let root_url = url.trim_end_matches("/aa/evidence").to_string();
-        let attester = GuestComponentsRestAttester::new(root_url);
-        let evidence = attester
-            .get_evidence(Tee::Tdx, &test_challenge(b"expected-nonce"))
-            .await?;
-
-        assert_eq!(evidence[0].runtime_data, vec![1, 2, 3, 4]);
-        assert!(
-            request
-                .await??
-                .contains("GET /aa/evidence?runtime_data=expected-nonce ")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guest_components_rest_attester_reports_http_error() -> Result<()> {
-        let (url, _request) =
-            spawn_evidence_server_with_status(503, b"aa unavailable".to_vec()).await?;
-        let attester = GuestComponentsRestAttester::new(url);
-
-        let err = attester
-            .get_evidence(Tee::Tdx, &test_challenge(b"expected-nonce"))
-            .await
-            .expect_err("non-success status should fail");
-
-        assert!(err.to_string().contains("503"));
-        assert!(err.to_string().contains("aa unavailable"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guest_components_rest_attester_rejects_invalid_tdx_quote() -> Result<()> {
-        let (url, _request) =
-            spawn_evidence_server(br#"{"quote":"not-base64!!!"}"#.to_vec()).await?;
-        let attester = GuestComponentsRestAttester::new(url);
-
-        let err = attester
-            .get_evidence(Tee::Tdx, &test_challenge(b"expected-nonce"))
-            .await
-            .expect_err("invalid quote encoding should fail");
-
-        assert!(
-            err.to_string()
-                .contains("failed to decode guest-components TDX quote")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guest_components_rest_attester_rejects_invalid_cca_shape() -> Result<()> {
-        let (url, _request) = spawn_evidence_server(br#"{"token":{"bad":true}}"#.to_vec()).await?;
-        let attester = GuestComponentsRestAttester::new(url);
-
-        let err = attester
-            .get_evidence(Tee::Cca, &test_challenge(b"expected-nonce"))
-            .await
-            .expect_err("invalid token shape should fail");
-
-        assert!(
-            err.to_string()
-                .contains("failed to parse guest-components CCA evidence")
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guest_components_rest_attester_rejects_non_utf8_nonce() -> Result<()> {
-        let attester = GuestComponentsRestAttester::new("http://127.0.0.1:1/aa/evidence");
-
-        let err = attester
-            .get_evidence(Tee::Tdx, &test_challenge(&[0xff; 8]))
-            .await
-            .expect_err("non-UTF-8 nonce should fail before HTTP request");
-
-        assert!(err.to_string().contains("requires a UTF-8 challenge nonce"));
         Ok(())
     }
 
@@ -844,44 +579,6 @@ mod tests {
             mode: Mode::Passport,
             nonce: nonce.to_vec(),
             challenge_token: b"token".to_vec(),
-        }
-    }
-
-    async fn spawn_evidence_server(
-        body: Vec<u8>,
-    ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
-        spawn_evidence_server_with_status(200, body).await
-    }
-
-    async fn spawn_evidence_server_with_status(
-        status: u16,
-        body: Vec<u8>,
-    ) -> Result<(String, tokio::task::JoinHandle<Result<String>>)> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        let handle = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await?;
-            let mut buf = [0u8; 1024];
-            let n = socket.read(&mut buf).await?;
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            let header = format!(
-                "HTTP/1.1 {status} {}\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\n\r\n",
-                reason_phrase(status),
-                body.len()
-            );
-            socket.write_all(header.as_bytes()).await?;
-            socket.write_all(&body).await?;
-            Ok(request)
-        });
-
-        Ok((format!("http://{addr}/aa/evidence"), handle))
-    }
-
-    fn reason_phrase(status: u16) -> &'static str {
-        match status {
-            200 => "OK",
-            503 => "Service Unavailable",
-            _ => "Status",
         }
     }
 }

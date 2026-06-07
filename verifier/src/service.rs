@@ -1,11 +1,24 @@
 use anyhow::Result;
+use protos::EvidenceSource;
 use protos::Tee;
 use protos::challenge::{self, ChallengeTokenClaims};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use crate::config::VerifierConfig;
-use crate::core::{AppraisalPolicy, DefaultVerifierFactory, VerificationContext, VerifierFactory};
+use crate::core::{
+    CsvAppraisalPolicy, DefaultVerifierFactory, VerificationContext, VerifierFactory,
+};
+
+fn evidence_source_token_value(source: EvidenceSource) -> &'static str {
+    match source {
+        EvidenceSource::Unspecified => "unspecified",
+        EvidenceSource::FileBacked => "file-backed",
+        EvidenceSource::GuestComponentsGrpc => "guest-components-grpc",
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct IssueChallengeInput {
@@ -25,7 +38,7 @@ pub struct VerifyEvidenceInput {
     pub tee: Tee,
     pub evidence: Vec<u8>,
     pub challenge_token: Vec<u8>,
-    pub evidence_source: String,
+    pub evidence_source: EvidenceSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,7 +186,6 @@ pub trait ChallengeTokenManager: Send + Sync {
 
 #[derive(Default)]
 pub struct DefaultChallengeTokenManager;
-
 impl ChallengeTokenManager for DefaultChallengeTokenManager {
     fn issue(
         &self,
@@ -197,12 +209,72 @@ impl ChallengeTokenManager for DefaultChallengeTokenManager {
     }
 }
 
+/// ADR 0005：challenge consume-once 防重放。verifier 在 `verify()` 入口处调用 try_consume；
+/// 命中已存在条目即返回 AlreadyConsumed，service 层将其映射为 InvalidArgument 并拒签。
+pub trait ChallengeReplayGuard: Send + Sync {
+    fn try_consume(&self, challenge_id: &str, expires_at: i64) -> Result<(), AlreadyConsumed>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlreadyConsumed;
+
+const REPLAY_GUARD_LAZY_SCAN_LIMIT: usize = 32;
+
+pub struct InMemoryChallengeReplayGuard {
+    consumed: Mutex<HashMap<String, i64>>,
+}
+
+impl InMemoryChallengeReplayGuard {
+    pub fn new() -> Self {
+        Self {
+            consumed: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
+impl Default for InMemoryChallengeReplayGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChallengeReplayGuard for InMemoryChallengeReplayGuard {
+    fn try_consume(&self, challenge_id: &str, expires_at: i64) -> Result<(), AlreadyConsumed> {
+        let mut consumed = self.consumed.lock().expect("replay guard poisoned");
+        let now = Self::now_secs();
+
+        // 惰性清理：每次最多扫描 N 条已过期的条目。
+        let expired: Vec<String> = consumed
+            .iter()
+            .filter(|&(_, &exp)| exp <= now)
+            .take(REPLAY_GUARD_LAZY_SCAN_LIMIT)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            consumed.remove(&id);
+        }
+
+        if consumed.contains_key(challenge_id) {
+            return Err(AlreadyConsumed);
+        }
+        consumed.insert(challenge_id.to_string(), expires_at);
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct ServiceConfig {
     pub challenge_ttl_secs: u64,
     pub allow_test_nonce: bool,
     pub challenge_signing_key: Vec<u8>,
-    pub appraisal_policy: AppraisalPolicy,
+    pub csv_appraisal_policy: CsvAppraisalPolicy,
 }
 
 impl ServiceConfig {
@@ -211,7 +283,7 @@ impl ServiceConfig {
             challenge_ttl_secs: config.challenge_ttl_secs,
             allow_test_nonce: config.allow_test_nonce,
             challenge_signing_key: crate::config::read_binary(&config.challenge_signing_key_path)?,
-            appraisal_policy: AppraisalPolicy::from_runtime_config(config)?,
+            csv_appraisal_policy: CsvAppraisalPolicy::from_runtime_config(config)?,
         })
     }
 }
@@ -220,6 +292,7 @@ pub struct VerifierApplicationService {
     config: ServiceConfig,
     verifier_factory: Arc<dyn VerifierFactory>,
     challenge_tokens: Arc<dyn ChallengeTokenManager>,
+    replay_guard: Arc<dyn ChallengeReplayGuard>,
 }
 
 impl VerifierApplicationService {
@@ -228,10 +301,25 @@ impl VerifierApplicationService {
         verifier_factory: Arc<dyn VerifierFactory>,
         challenge_tokens: Arc<dyn ChallengeTokenManager>,
     ) -> Self {
+        Self::new_with_replay_guard(
+            config,
+            verifier_factory,
+            challenge_tokens,
+            Arc::new(InMemoryChallengeReplayGuard::new()),
+        )
+    }
+
+    pub fn new_with_replay_guard(
+        config: ServiceConfig,
+        verifier_factory: Arc<dyn VerifierFactory>,
+        challenge_tokens: Arc<dyn ChallengeTokenManager>,
+        replay_guard: Arc<dyn ChallengeReplayGuard>,
+    ) -> Self {
         Self {
             config,
             verifier_factory,
             challenge_tokens,
+            replay_guard,
         }
     }
 
@@ -328,16 +416,26 @@ impl VerifierApplicationService {
         if input.tee == Tee::Unspecified {
             warn!(
                 tee = ?input.tee,
-                evidence_source = %input.evidence_source,
+                evidence_source = ?input.evidence_source,
                 evidence_len = input.evidence.len(),
                 "rejected verification request"
             );
             return Err(ServiceError::invalid_argument("unsupported tee"));
         }
+        if input.evidence_source == EvidenceSource::Unspecified {
+            warn!(
+                tee = ?input.tee,
+                evidence_source = ?input.evidence_source,
+                evidence_len = input.evidence.len(),
+                "rejected verification request: evidence_source unspecified"
+            );
+            return Err(ServiceError::invalid_argument("missing evidence_source"));
+        }
+        let evidence_source_label = evidence_source_token_value(input.evidence_source);
 
         info!(
             tee = ?input.tee,
-            evidence_source = %input.evidence_source,
+            evidence_source = evidence_source_label,
             evidence_len = input.evidence.len(),
             challenge_token_len = input.challenge_token.len(),
             "verifying evidence"
@@ -352,7 +450,7 @@ impl VerifierApplicationService {
             Err(err) => {
                 warn!(
                     tee = ?input.tee,
-                    evidence_source = %input.evidence_source,
+                    evidence_source = evidence_source_label,
                     evidence_len = input.evidence.len(),
                     error = %err,
                     "rejected verification request with invalid challenge"
@@ -361,13 +459,28 @@ impl VerifierApplicationService {
             }
         };
         let challenge_id = challenge.challenge_id();
+        let expires_at = challenge.expires_at;
+
+        if self
+            .replay_guard
+            .try_consume(&challenge_id, expires_at)
+            .is_err()
+        {
+            warn!(
+                tee = ?input.tee,
+                evidence_source = evidence_source_label,
+                challenge_id = %challenge_id,
+                "rejected verification request: challenge already consumed"
+            );
+            return Err(ServiceError::invalid_argument("challenge already consumed"));
+        }
 
         let verifier = match self.verifier_factory.resolve(input.tee) {
             Ok(verifier) => verifier,
             Err(err) => {
                 warn!(
                     tee = ?input.tee,
-                    evidence_source = %input.evidence_source,
+                    evidence_source = evidence_source_label,
                     challenge_id = %challenge_id,
                     error = %err,
                     "failed to resolve verifier"
@@ -375,8 +488,8 @@ impl VerifierApplicationService {
                 return Err(ServiceError::internal(err.to_string()));
             }
         };
-        let context = VerificationContext::new(challenge, input.evidence_source)
-            .with_appraisal_policy(self.config.appraisal_policy.clone());
+        let context = VerificationContext::new(challenge, evidence_source_label)
+            .with_csv_appraisal_policy(self.config.csv_appraisal_policy.clone());
         let token = match verifier.verify(&input.evidence, &context).await {
             Ok(token) => {
                 let event = AuditEvent::verification_accepted(input.tee, &context);
@@ -540,7 +653,7 @@ mod tests {
             challenge_ttl_secs: 60,
             allow_test_nonce: true,
             challenge_signing_key: b"test-key".to_vec(),
-            appraisal_policy: AppraisalPolicy::disabled(),
+            csv_appraisal_policy: CsvAppraisalPolicy::disabled(),
         }
     }
 
@@ -648,7 +761,7 @@ mod tests {
                 tee: Tee::Csv,
                 evidence: b"evidence".to_vec(),
                 challenge_token: b"challenge".to_vec(),
-                evidence_source: "guest-components-rest".to_string(),
+                evidence_source: EvidenceSource::GuestComponentsGrpc,
             })
             .await
             .expect("verification should succeed");
@@ -678,7 +791,7 @@ mod tests {
                 tee: Tee::Csv,
                 evidence: b"evidence".to_vec(),
                 challenge_token: b"challenge".to_vec(),
-                evidence_source: "guest-components-rest".to_string(),
+                evidence_source: EvidenceSource::GuestComponentsGrpc,
             })
             .await
             .expect("verification should succeed");
@@ -686,7 +799,7 @@ mod tests {
         assert_eq!(result.attestation_token, b"signed-token");
         assert_eq!(
             seen_evidence_source.lock().unwrap().as_deref(),
-            Some("guest-components-rest")
+            Some("guest-components-grpc")
         );
     }
 
@@ -706,7 +819,7 @@ mod tests {
                 tee: Tee::Csv,
                 evidence: b"evidence".to_vec(),
                 challenge_token: b"challenge".to_vec(),
-                evidence_source: "file-backed".to_string(),
+                evidence_source: EvidenceSource::FileBacked,
             })
             .await;
 

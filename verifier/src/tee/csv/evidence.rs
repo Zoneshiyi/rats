@@ -9,12 +9,9 @@ use super::certs::{CertificateChain, RawEcdsaSignature};
 const ATTESTATION_EXT_MAGIC: [u8; 16] = *b"ATTESTATION_EXT\0";
 const CSV_RTMR_REG_SIZE: usize = 32;
 
-pub(crate) enum CsvEvidenceEnvelope {
-    Trustee {
-        evidence: Box<TrusteeCsvEvidence>,
-        raw: Value,
-    },
-    Simplified(Value),
+pub(crate) struct CsvEvidence {
+    pub evidence: Box<TrusteeCsvEvidence>,
+    pub raw: Value,
 }
 
 #[derive(Deserialize)]
@@ -233,19 +230,18 @@ impl TeeInfoRef<'_> {
     }
 }
 
-pub(crate) fn parse_evidence(raw_evidence: &[u8]) -> Result<CsvEvidenceEnvelope> {
+pub(crate) fn parse_evidence(raw_evidence: &[u8]) -> Result<CsvEvidence> {
     let value: Value = serde_json::from_slice(raw_evidence)?;
-    if value.get("attestation_report").is_some() {
-        Ok(CsvEvidenceEnvelope::Trustee {
-            evidence: Box::new(
-                serde_json::from_value(value.clone())
-                    .context("failed to parse trustee-style CSV evidence")?,
-            ),
-            raw: value,
-        })
-    } else {
-        Ok(CsvEvidenceEnvelope::Simplified(value))
+    if value.get("attestation_report").is_none() {
+        bail!("CSV evidence must contain attestation_report (trustee-style)");
     }
+    Ok(CsvEvidence {
+        evidence: Box::new(
+            serde_json::from_value(value.clone())
+                .context("failed to parse trustee-style CSV evidence")?,
+        ),
+        raw: value,
+    })
 }
 
 pub(crate) fn parse_attestation_report(

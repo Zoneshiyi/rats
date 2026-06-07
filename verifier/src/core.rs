@@ -31,10 +31,22 @@ impl ChallengeBindingStatus {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AppraisalPolicy {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CsvAppraisalPolicy {
     policy_id: Option<String>,
     csv_allowed_measurements: Vec<String>,
+    /// ADR 0002: 默认拒绝 debug=on（即 CSV `nodbg` 位为 0）。
+    forbid_debug: bool,
+}
+
+impl Default for CsvAppraisalPolicy {
+    fn default() -> Self {
+        Self {
+            policy_id: None,
+            csv_allowed_measurements: Vec::new(),
+            forbid_debug: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,16 +60,27 @@ struct AppraisalPolicyFile {
     policy_id: Option<String>,
     #[serde(default)]
     csv_allowed_measurements: Vec<String>,
+    #[serde(default = "default_forbid_debug")]
+    forbid_debug: bool,
 }
 
-impl AppraisalPolicy {
+fn default_forbid_debug() -> bool {
+    true
+}
+
+impl CsvAppraisalPolicy {
     pub fn disabled() -> Self {
-        Self::default()
+        Self {
+            policy_id: None,
+            csv_allowed_measurements: Vec::new(),
+            forbid_debug: false,
+        }
     }
 
     pub fn from_runtime_config(config: &crate::config::VerifierConfig) -> Result<Self> {
         let Some(path) = &config.appraisal_policy_path else {
-            return Ok(Self::disabled());
+            // 未配置 policy 文件时仍启用 forbid_debug（生产基线安全姿态）。
+            return Ok(Self::default());
         };
         let content = crate::config::read_text(path)
             .with_context(|| format!("read appraisal policy file `{path}`"))?;
@@ -70,16 +93,35 @@ impl AppraisalPolicy {
         Ok(Self {
             policy_id: policy.policy_id,
             csv_allowed_measurements: policy.csv_allowed_measurements,
+            forbid_debug: policy.forbid_debug,
         })
     }
 
-    pub fn evaluate_csv_measurement(
+    /// 校验 CSV `measure` 与 `nodbg` 位，返回 appraisal 结果。
+    ///
+    /// `nodbg = 1` 表示 debug 关闭；`forbid_debug = true` 时若 `nodbg = 0` 则拒签。
+    /// 同时若配置了 `csv_allowed_measurements`，则 `measure` 必须命中白名单。
+    /// 当两类校验都未配置（白名单空 + forbid_debug=false）时返回 `None`，跳过 appraisal。
+    pub fn evaluate_csv(
         &self,
         measure: Option<&str>,
+        nodbg: bool,
     ) -> Result<Option<AppraisalOutcome>> {
-        if self.csv_allowed_measurements.is_empty() {
-            return Ok(None);
+        if self.forbid_debug && !nodbg {
+            bail!("appraisal policy rejected CSV evidence: debug mode is enabled (nodbg=0)");
         }
+
+        if self.csv_allowed_measurements.is_empty() {
+            return if self.forbid_debug {
+                Ok(Some(AppraisalOutcome {
+                    policy_id: self.policy_id(),
+                    result: "passed".to_string(),
+                }))
+            } else {
+                Ok(None)
+            };
+        }
+
         let measure = measure.context("appraisal policy requires CSV measurement")?;
         if self
             .csv_allowed_measurements
@@ -106,7 +148,7 @@ impl AppraisalPolicy {
 pub struct VerificationContext {
     pub challenge: ChallengeTokenClaims,
     evidence_source: String,
-    appraisal_policy: AppraisalPolicy,
+    csv_appraisal_policy: CsvAppraisalPolicy,
 }
 
 impl VerificationContext {
@@ -119,7 +161,7 @@ impl VerificationContext {
         Self {
             challenge,
             evidence_source,
-            appraisal_policy: AppraisalPolicy::disabled(),
+            csv_appraisal_policy: CsvAppraisalPolicy::disabled(),
         }
     }
 
@@ -131,13 +173,13 @@ impl VerificationContext {
         self.challenge.challenge_id()
     }
 
-    pub fn with_appraisal_policy(mut self, appraisal_policy: AppraisalPolicy) -> Self {
-        self.appraisal_policy = appraisal_policy;
+    pub fn with_csv_appraisal_policy(mut self, policy: CsvAppraisalPolicy) -> Self {
+        self.csv_appraisal_policy = policy;
         self
     }
 
-    pub fn appraisal_policy(&self) -> &AppraisalPolicy {
-        &self.appraisal_policy
+    pub fn csv_appraisal_policy(&self) -> &CsvAppraisalPolicy {
+        &self.csv_appraisal_policy
     }
 }
 
@@ -347,7 +389,7 @@ mod tests {
 
     #[test]
     fn appraisal_policy_accepts_allowed_csv_measurement() -> Result<()> {
-        let policy = AppraisalPolicy::from_toml(
+        let policy = CsvAppraisalPolicy::from_toml(
             r#"
 policy_id = "csv-demo-policy"
 csv_allowed_measurements = ["abc123"]
@@ -355,7 +397,7 @@ csv_allowed_measurements = ["abc123"]
         )?;
 
         let outcome = policy
-            .evaluate_csv_measurement(Some("ABC123"))?
+            .evaluate_csv(Some("ABC123"), true)?
             .expect("policy should be evaluated");
 
         assert_eq!(outcome.policy_id, "csv-demo-policy");
@@ -365,7 +407,7 @@ csv_allowed_measurements = ["abc123"]
 
     #[test]
     fn appraisal_policy_rejects_unexpected_csv_measurement() -> Result<()> {
-        let policy = AppraisalPolicy::from_toml(
+        let policy = CsvAppraisalPolicy::from_toml(
             r#"
 policy_id = "csv-demo-policy"
 csv_allowed_measurements = ["expected"]
@@ -373,10 +415,33 @@ csv_allowed_measurements = ["expected"]
         )?;
 
         let err = policy
-            .evaluate_csv_measurement(Some("unexpected"))
+            .evaluate_csv(Some("unexpected"), true)
             .expect_err("unexpected measurement should fail");
 
         assert!(err.to_string().contains("rejected CSV measurement"));
+        Ok(())
+    }
+
+    #[test]
+    fn appraisal_policy_rejects_debug_on() -> Result<()> {
+        let policy = CsvAppraisalPolicy::default();
+
+        let err = policy
+            .evaluate_csv(None, false)
+            .expect_err("debug=on (nodbg=0) should be rejected by default");
+
+        assert!(err.to_string().contains("debug mode is enabled"));
+        Ok(())
+    }
+
+    #[test]
+    fn appraisal_policy_disabled_skips_evaluation() -> Result<()> {
+        let policy = CsvAppraisalPolicy::disabled();
+
+        // disabled policy 不强制 forbid_debug 也不强制白名单，返回 None。
+        let outcome = policy.evaluate_csv(None, false)?;
+
+        assert!(outcome.is_none());
         Ok(())
     }
 }

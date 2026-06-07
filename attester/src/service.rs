@@ -1,12 +1,18 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use protos::{Mode, Tee};
+use protos::{EvidenceSource, Mode, Tee};
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::core::{AttestationChallenge, Attester, AttesterEvidence, decode_attestation_challenge};
 
-const DEFAULT_EVIDENCE_SOURCE: &str = "file-backed";
+fn evidence_source_token(source: EvidenceSource) -> &'static str {
+    match source {
+        EvidenceSource::Unspecified => "unspecified",
+        EvidenceSource::FileBacked => "file-backed",
+        EvidenceSource::GuestComponentsGrpc => "guest-components-grpc",
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedChallenge {
@@ -91,13 +97,13 @@ pub trait VerifierGateway: Send + Sync {
         tee: Tee,
         raw_evidence: &[u8],
         challenge_token: &[u8],
-        evidence_source: &str,
+        evidence_source: EvidenceSource,
     ) -> Result<String>;
 }
 
 pub struct AttesterApplicationService {
     tee: Tee,
-    evidence_source: String,
+    evidence_source: EvidenceSource,
     attester: Arc<dyn Attester>,
     verifier_gateway: Arc<dyn VerifierGateway>,
 }
@@ -108,18 +114,18 @@ impl AttesterApplicationService {
         attester: Arc<dyn Attester>,
         verifier_gateway: Arc<dyn VerifierGateway>,
     ) -> Self {
-        Self::new_with_evidence_source(tee, DEFAULT_EVIDENCE_SOURCE, attester, verifier_gateway)
+        Self::new_with_evidence_source(tee, EvidenceSource::FileBacked, attester, verifier_gateway)
     }
 
     pub fn new_with_evidence_source(
         tee: Tee,
-        evidence_source: impl Into<String>,
+        evidence_source: EvidenceSource,
         attester: Arc<dyn Attester>,
         verifier_gateway: Arc<dyn VerifierGateway>,
     ) -> Self {
         Self {
             tee,
-            evidence_source: evidence_source.into(),
+            evidence_source,
             attester,
             verifier_gateway,
         }
@@ -180,7 +186,7 @@ impl AttesterApplicationService {
         info!(
             tee = ?self.tee,
             mode = ?challenge.mode,
-            evidence_source = %self.evidence_source,
+            evidence_source = evidence_source_token(self.evidence_source),
             runtime_data_len = challenge.nonce.len(),
             "collecting attestation evidence"
         );
@@ -190,7 +196,7 @@ impl AttesterApplicationService {
                 warn!(
                     tee = ?self.tee,
                     mode = ?challenge.mode,
-                    evidence_source = %self.evidence_source,
+                    evidence_source = evidence_source_token(self.evidence_source),
                     error = %err,
                     "failed to collect attestation evidence"
                 );
@@ -200,7 +206,7 @@ impl AttesterApplicationService {
         info!(
             tee = ?self.tee,
             mode = ?challenge.mode,
-            evidence_source = %self.evidence_source,
+            evidence_source = evidence_source_token(self.evidence_source),
             evidence_count = evidence.len(),
             first_evidence_len = ?evidence.first().map(|evidence| evidence.runtime_data.len()),
             "collected attestation evidence"
@@ -217,7 +223,7 @@ impl AttesterApplicationService {
                         self.tee,
                         &raw.runtime_data,
                         &challenge.challenge_token,
-                        &self.evidence_source,
+                        self.evidence_source,
                     )
                     .await
                 {
@@ -226,7 +232,7 @@ impl AttesterApplicationService {
                         warn!(
                             tee = ?self.tee,
                             mode = ?challenge.mode,
-                            evidence_source = %self.evidence_source,
+                            evidence_source = evidence_source_token(self.evidence_source),
                             evidence_len = raw.runtime_data.len(),
                             error = %err,
                             "passport verification failed"
@@ -237,20 +243,28 @@ impl AttesterApplicationService {
                 info!(
                     tee = ?self.tee,
                     mode = ?challenge.mode,
-                    evidence_source = %self.evidence_source,
+                    evidence_source = evidence_source_token(self.evidence_source),
                     attestation_token_len = token.len(),
                     "passport verification accepted"
                 );
                 Ok(AttestationOutcome::AttestationToken(token.into_bytes()))
             }
-            Mode::BackgroundCheck | Mode::Mix => {
+            Mode::BackgroundCheck => {
                 info!(
                     tee = ?self.tee,
                     mode = ?challenge.mode,
-                    evidence_source = %self.evidence_source,
+                    evidence_source = evidence_source_token(self.evidence_source),
                     "returning evidence list for deferred verification"
                 );
                 Ok(AttestationOutcome::EvidenceList(evidence))
+            }
+            Mode::Mix => {
+                // ADR 0004：Mix 语义已锁定为多 evidence 聚合，但当前阶段未落地实现，
+                // 直接拒签以避免空壳占位行为继续误导调用方。
+                warn!(tee = ?self.tee, "rejected mix mode: not yet implemented");
+                Err(ServiceError::unsupported_mode(
+                    "mix mode is reserved for multi-evidence aggregation and not yet implemented",
+                ))
             }
             Mode::Unspecified => {
                 warn!(tee = ?self.tee, mode = ?challenge.mode, "rejected unsupported mode");
@@ -271,7 +285,7 @@ impl AttesterApplicationService {
 
         info!(
             tee = ?self.tee,
-            evidence_source = %self.evidence_source,
+            evidence_source = evidence_source_token(self.evidence_source),
             evidence_len = evidence.runtime_data.len(),
             "requesting verifier evaluation"
         );
@@ -281,7 +295,7 @@ impl AttesterApplicationService {
                 self.tee,
                 &evidence.runtime_data,
                 &challenge_token,
-                &self.evidence_source,
+                self.evidence_source,
             )
             .await
         {
@@ -289,7 +303,7 @@ impl AttesterApplicationService {
             Err(err) => {
                 warn!(
                     tee = ?self.tee,
-                    evidence_source = %self.evidence_source,
+                    evidence_source = evidence_source_token(self.evidence_source),
                     evidence_len = evidence.runtime_data.len(),
                     error = %err,
                     "verifier evaluation failed"
@@ -299,7 +313,7 @@ impl AttesterApplicationService {
         };
         info!(
             tee = ?self.tee,
-            evidence_source = %self.evidence_source,
+            evidence_source = evidence_source_token(self.evidence_source),
             attestation_token_len = token.len(),
             "verifier evaluation accepted"
         );
@@ -356,7 +370,7 @@ mod tests {
     struct FakeVerifierGateway {
         issue_result: Mutex<Option<Result<IssueResult>>>,
         verify_result: Mutex<Option<Result<String>>>,
-        seen_evidence_source: Mutex<Option<String>>,
+        seen_evidence_source: Mutex<Option<EvidenceSource>>,
     }
 
     type IssueResult = (Vec<u8>, Vec<u8>);
@@ -391,9 +405,9 @@ mod tests {
             _tee: Tee,
             _raw_evidence: &[u8],
             _challenge_token: &[u8],
-            evidence_source: &str,
+            evidence_source: EvidenceSource,
         ) -> Result<String> {
-            *self.seen_evidence_source.lock().unwrap() = Some(evidence_source.to_string());
+            *self.seen_evidence_source.lock().unwrap() = Some(evidence_source);
             self.verify_result
                 .lock()
                 .unwrap()
@@ -439,7 +453,7 @@ mod tests {
         ));
         let service = AttesterApplicationService::new_with_evidence_source(
             Tee::Csv,
-            "guest-components-rest",
+            EvidenceSource::GuestComponentsGrpc,
             Arc::new(FakeAttester::new(Ok(vec![AttesterEvidence {
                 init_data: b"nonce".to_vec(),
                 runtime_data: b"evidence".to_vec(),
@@ -456,8 +470,8 @@ mod tests {
             AttestationOutcome::AttestationToken(b"signed-token".to_vec())
         );
         assert_eq!(
-            gateway.seen_evidence_source.lock().unwrap().as_deref(),
-            Some("guest-components-rest")
+            *gateway.seen_evidence_source.lock().unwrap(),
+            Some(EvidenceSource::GuestComponentsGrpc)
         );
         Ok(())
     }

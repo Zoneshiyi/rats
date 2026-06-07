@@ -1,9 +1,10 @@
 use anyhow::Result;
-use attester::config::{AttesterConfig, EvidenceSource};
+use attester::config::{AttesterConfig, evidence_source_token_value};
 use attester::{
     Attester, AttesterApplicationService, FileBackedAttester, GrpcVerifierGateway,
-    GuestComponentsGrpcAttester, GuestComponentsRestAttester, into_grpc_service,
+    GuestComponentsGrpcAttester, into_grpc_service,
 };
+use protos::EvidenceSource;
 use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
@@ -18,29 +19,29 @@ async fn main() -> Result<()> {
     let tee = config.parse_tee()?;
     let evidence_source = config.parse_evidence_source()?;
     let attester: Arc<dyn Attester> = match evidence_source {
-        EvidenceSource::File => Arc::new(FileBackedAttester::new(
+        EvidenceSource::FileBacked => Arc::new(FileBackedAttester::new(
             config.cca_evidence_path,
             config.tdx_evidence_path,
             config.csv_evidence_path,
             config.kunpeng_evidence_path,
         )),
-        EvidenceSource::GuestComponentsRest => {
-            Arc::new(GuestComponentsRestAttester::new(config.aa_evidence_url))
-        }
         EvidenceSource::GuestComponentsGrpc => {
-            Arc::new(GuestComponentsGrpcAttester::new(config.aa_evidence_url))
+            Arc::new(GuestComponentsGrpcAttester::new(config.aa_endpoint))
+        }
+        EvidenceSource::Unspecified => {
+            anyhow::bail!("attester evidence_source must not be unspecified");
         }
     };
     let service = Arc::new(AttesterApplicationService::new_with_evidence_source(
         tee,
-        evidence_source.as_token_value(),
+        evidence_source,
         attester,
         Arc::new(GrpcVerifierGateway::new(config.verifier_addr)),
     ));
     info!(
         addr = %socket_addr,
         tee = ?tee,
-        evidence_source = evidence_source.as_token_value(),
+        evidence_source = evidence_source_token_value(evidence_source),
         "starting attester service"
     );
     Server::builder()

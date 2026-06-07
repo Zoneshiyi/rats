@@ -136,7 +136,6 @@ dependencies = [
  "base64 0.22.1",
  "kbs-types",
  "protos",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",

@@ -2,21 +2,19 @@ mod certs;
 mod evidence;
 mod kds;
 
-use anyhow::Context;
 use async_trait::async_trait;
 use ear::{Algorithm, Appraisal, Profile, RawValue, RawValueKind, register_profile};
-use serde::Deserialize;
 use serde_json::Value;
 
 use self::certs::{CertificateChainSource, verify_certificate_chain};
 use self::evidence::{
-    CsvEvidenceEnvelope, encode_hex, parse_attestation_report, parse_evidence, policy_to_json,
+    CsvEvidence, encode_hex, parse_attestation_report, parse_evidence, policy_to_json,
     trim_null_terminated,
 };
 use self::kds::resolve_certificate_chain;
 use crate::{
-    ChallengeBindingStatus, Result, VerificationContext, Verifier, apply_appraisal,
-    apply_challenge, config, init_ear, verify_challenge_binding,
+    Result, VerificationContext, Verifier, apply_appraisal, apply_challenge, config, init_ear,
+    verify_challenge_binding,
 };
 
 #[derive(Debug, Default)]
@@ -36,36 +34,22 @@ const EXT_CERT_CHAIN_EMBEDDED: i32 = 2010;
 const EXT_CERT_CHAIN_VALIDATION: i32 = 2011;
 const EXT_CERT_CHAIN_SOURCE: i32 = 2012;
 
-#[derive(Debug, Deserialize)]
-struct SimplifiedCsvEvidence {
+#[derive(Debug)]
+struct CsvClaims {
     version: String,
     serial_number: String,
     report_data: String,
-    #[serde(alias = "measurement")]
     measure: String,
-    #[serde(default)]
-    policy: Value,
-    #[serde(default)]
+    policy_json: String,
+    nodbg: bool,
     user_pubkey_digest: String,
-    #[serde(default)]
     cc_eventlog: Option<String>,
-}
-
-#[derive(Debug)]
-struct CsvClaims {
-    version: Option<String>,
-    serial_number: String,
-    report_data: Option<String>,
-    measure: Option<String>,
-    policy_json: Option<String>,
-    user_pubkey_digest: Option<String>,
-    cc_eventlog: Option<String>,
-    evidence_shape: String,
+    evidence_shape: &'static str,
     attestation_report_len: Option<i64>,
-    cert_chain_embedded: Option<i64>,
-    cert_chain_validation: Option<String>,
-    cert_chain_source: Option<String>,
-    challenge_binding_data: Option<Vec<u8>>,
+    cert_chain_embedded: bool,
+    cert_chain_validation: &'static str,
+    cert_chain_source: &'static str,
+    challenge_binding_data: Vec<u8>,
 }
 
 fn init_profile() -> Result<()> {
@@ -118,96 +102,67 @@ fn init_profile() -> Result<()> {
     Ok(())
 }
 
-async fn normalize_claims(evidence: CsvEvidenceEnvelope) -> Result<CsvClaims> {
-    match evidence {
-        CsvEvidenceEnvelope::Simplified(evidence) => {
-            let evidence: SimplifiedCsvEvidence = serde_json::from_value(evidence)
-                .context("failed to parse simplified CSV evidence")?;
-            Ok(CsvClaims {
-                version: Some(evidence.version),
-                serial_number: evidence.serial_number,
-                report_data: Some(evidence.report_data),
-                measure: Some(evidence.measure),
-                policy_json: Some(serde_json::to_string(&evidence.policy)?),
-                user_pubkey_digest: (!evidence.user_pubkey_digest.is_empty())
-                    .then_some(evidence.user_pubkey_digest),
-                cc_eventlog: evidence.cc_eventlog,
-                evidence_shape: "normalized-mock".to_string(),
-                attestation_report_len: None,
-                cert_chain_embedded: None,
-                cert_chain_validation: Some("not_applicable".to_string()),
-                cert_chain_source: Some("mock".to_string()),
-                challenge_binding_data: None,
-            })
-        }
-        CsvEvidenceEnvelope::Trustee { evidence, raw } => {
-            let serial_number = trim_null_terminated(&evidence.serial_number)?;
-            let report = parse_attestation_report(&evidence.attestation_report)?;
-            let resolved_chain =
-                resolve_certificate_chain(&serial_number, evidence.cert_chain).await?;
-            verify_certificate_chain(&report, &resolved_chain)?;
-            let report_data = report.tee_info().report_data();
+async fn normalize_claims(evidence: CsvEvidence) -> Result<CsvClaims> {
+    let CsvEvidence { evidence, raw } = evidence;
+    let serial_number = trim_null_terminated(&evidence.serial_number)?;
+    let report = parse_attestation_report(&evidence.attestation_report)?;
+    let resolved_chain = resolve_certificate_chain(&serial_number, evidence.cert_chain).await?;
+    verify_certificate_chain(&report, &resolved_chain)?;
+    let report_data = report.tee_info().report_data();
+    let policy = report.tee_info().policy();
+    let nodbg = policy.nodbg() == 1;
 
-            Ok(CsvClaims {
-                version: Some(report.version().to_string()),
-                serial_number,
-                report_data: Some(encode_hex(&report_data)),
-                measure: Some(encode_hex(&report.tee_info().measure())),
-                policy_json: Some(policy_to_json(report.tee_info().policy())?),
-                user_pubkey_digest: Some(encode_hex(&report.tee_info().user_pubkey_digest())),
-                cc_eventlog: evidence.cc_eventlog,
-                evidence_shape: "trustee-reference-json".to_string(),
-                attestation_report_len: raw
-                    .pointer("/attestation_report/data")
-                    .and_then(Value::as_array)
-                    .map(|report_bytes| report_bytes.len() as i64),
-                cert_chain_embedded: Some(i64::from(raw.pointer("/cert_chain/hsk_cek").is_some())),
-                cert_chain_validation: Some("verified".to_string()),
-                cert_chain_source: Some(match resolved_chain.source {
-                    CertificateChainSource::Embedded => "embedded".to_string(),
-                    CertificateChainSource::LocalFile => "local-file".to_string(),
-                    CertificateChainSource::Kds => "kds".to_string(),
-                }),
-                challenge_binding_data: Some(report_data),
-            })
-        }
-    }
+    Ok(CsvClaims {
+        version: report.version().to_string(),
+        serial_number,
+        report_data: encode_hex(&report_data),
+        measure: encode_hex(&report.tee_info().measure()),
+        policy_json: policy_to_json(policy)?,
+        nodbg,
+        user_pubkey_digest: encode_hex(&report.tee_info().user_pubkey_digest()),
+        cc_eventlog: evidence.cc_eventlog,
+        evidence_shape: "trustee-reference-json",
+        attestation_report_len: raw
+            .pointer("/attestation_report/data")
+            .and_then(Value::as_array)
+            .map(|report_bytes| report_bytes.len() as i64),
+        cert_chain_embedded: raw.pointer("/cert_chain/hsk_cek").is_some(),
+        cert_chain_validation: "verified",
+        cert_chain_source: match resolved_chain.source {
+            CertificateChainSource::Embedded => "embedded",
+            CertificateChainSource::LocalFile => "local-file",
+            CertificateChainSource::Kds => "kds",
+        },
+        challenge_binding_data: report_data,
+    })
 }
 
 fn gen_ear_token(claims: &CsvClaims) -> Result<crate::Ear> {
     let mut token = init_ear(PROFILE_NAME)?;
 
     let mut appraisal = Appraisal::new_with_profile(PROFILE_NAME)?;
-    if let Some(version) = &claims.version {
-        appraisal
-            .extensions
-            .set_by_key(EXT_VERSION, RawValue::String(version.clone()))?;
-    }
+    appraisal
+        .extensions
+        .set_by_key(EXT_VERSION, RawValue::String(claims.version.clone()))?;
     appraisal.extensions.set_by_key(
         EXT_SERIAL_NUMBER,
         RawValue::String(claims.serial_number.clone()),
     )?;
-    if let Some(report_data) = &claims.report_data {
-        appraisal
-            .extensions
-            .set_by_key(EXT_REPORT_DATA, RawValue::String(report_data.clone()))?;
-    }
-    if let Some(measure) = &claims.measure {
-        appraisal
-            .extensions
-            .set_by_key(EXT_MEASURE, RawValue::String(measure.clone()))?;
-    }
-    if let Some(policy_json) = &claims.policy_json {
-        appraisal
-            .extensions
-            .set_by_key(EXT_POLICY_JSON, RawValue::String(policy_json.clone()))?;
-    }
-    if let Some(user_pubkey_digest) = &claims.user_pubkey_digest {
-        appraisal.extensions.set_by_key(
-            EXT_USER_PUBKEY_DIGEST,
-            RawValue::String(user_pubkey_digest.clone()),
-        )?;
-    }
+    appraisal.extensions.set_by_key(
+        EXT_REPORT_DATA,
+        RawValue::String(claims.report_data.clone()),
+    )?;
+    appraisal
+        .extensions
+        .set_by_key(EXT_MEASURE, RawValue::String(claims.measure.clone()))?;
+    appraisal.extensions.set_by_key(
+        EXT_POLICY_JSON,
+        RawValue::String(claims.policy_json.clone()),
+    )?;
+    appraisal.extensions.set_by_key(
+        EXT_USER_PUBKEY_DIGEST,
+        RawValue::String(claims.user_pubkey_digest.clone()),
+    )?;
     if let Some(cc_eventlog) = &claims.cc_eventlog {
         appraisal
             .extensions
@@ -215,7 +170,7 @@ fn gen_ear_token(claims: &CsvClaims) -> Result<crate::Ear> {
     }
     appraisal.extensions.set_by_key(
         EXT_EVIDENCE_SHAPE,
-        RawValue::String(claims.evidence_shape.clone()),
+        RawValue::String(claims.evidence_shape.to_string()),
     )?;
     if let Some(attestation_report_len) = claims.attestation_report_len {
         appraisal.extensions.set_by_key(
@@ -223,24 +178,18 @@ fn gen_ear_token(claims: &CsvClaims) -> Result<crate::Ear> {
             RawValue::Integer(attestation_report_len),
         )?;
     }
-    if let Some(cert_chain_embedded) = claims.cert_chain_embedded {
-        appraisal.extensions.set_by_key(
-            EXT_CERT_CHAIN_EMBEDDED,
-            RawValue::Integer(cert_chain_embedded),
-        )?;
-    }
-    if let Some(cert_chain_validation) = &claims.cert_chain_validation {
-        appraisal.extensions.set_by_key(
-            EXT_CERT_CHAIN_VALIDATION,
-            RawValue::String(cert_chain_validation.clone()),
-        )?;
-    }
-    if let Some(cert_chain_source) = &claims.cert_chain_source {
-        appraisal.extensions.set_by_key(
-            EXT_CERT_CHAIN_SOURCE,
-            RawValue::String(cert_chain_source.clone()),
-        )?;
-    }
+    appraisal.extensions.set_by_key(
+        EXT_CERT_CHAIN_EMBEDDED,
+        RawValue::Integer(i64::from(claims.cert_chain_embedded)),
+    )?;
+    appraisal.extensions.set_by_key(
+        EXT_CERT_CHAIN_VALIDATION,
+        RawValue::String(claims.cert_chain_validation.to_string()),
+    )?;
+    appraisal.extensions.set_by_key(
+        EXT_CERT_CHAIN_SOURCE,
+        RawValue::String(claims.cert_chain_source.to_string()),
+    )?;
     appraisal.update_status_from_trust_vector();
 
     token.submods.insert("csv".to_string(), appraisal);
@@ -256,12 +205,10 @@ impl Verifier for Csv {
         let claims = normalize_claims(evidence).await?;
         let mut ear_token = gen_ear_token(&claims)?;
         let appraisal = context
-            .appraisal_policy()
-            .evaluate_csv_measurement(claims.measure.as_deref())?;
-        let binding_status = match claims.challenge_binding_data.as_deref() {
-            Some(report_data) => verify_challenge_binding(report_data, &context.challenge)?,
-            None => ChallengeBindingStatus::Simulated,
-        };
+            .csv_appraisal_policy()
+            .evaluate_csv(Some(&claims.measure), claims.nodbg)?;
+        let binding_status =
+            verify_challenge_binding(&claims.challenge_binding_data, &context.challenge)?;
         apply_appraisal(&mut ear_token, appraisal)?;
         apply_challenge(
             &mut ear_token,
@@ -279,7 +226,7 @@ impl Verifier for Csv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AppraisalPolicy, ChallengeTokenClaims};
+    use crate::ChallengeTokenClaims;
     use protos::Tee;
 
     async fn challenge_from_csv_evidence(
@@ -288,11 +235,13 @@ mod tests {
     ) -> Result<ChallengeTokenClaims> {
         let evidence = parse_evidence(raw_evidence)?;
         let claims = normalize_claims(evidence).await?;
-        let report_data = claims
-            .challenge_binding_data
-            .expect("trustee CSV evidence should include report data");
-        let (_nonce, token) =
-            protos::challenge::issue(tee as i32, 1, Some(&report_data), 60, b"test-challenge-key")?;
+        let (_nonce, token) = protos::challenge::issue(
+            tee as i32,
+            1,
+            Some(&claims.challenge_binding_data),
+            60,
+            b"test-challenge-key",
+        )?;
         protos::challenge::decode(&token)
     }
 
@@ -312,17 +261,6 @@ mod tests {
             || err
                 .chain()
                 .any(|cause| cause.to_string().contains("missing HSK/CEK"))
-    }
-
-    fn simplified_csv_evidence(measure: &str) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&serde_json::json!({
-            "version": "mock-v1",
-            "serial_number": "mock-csv",
-            "report_data": "expected-nonce",
-            "measure": measure,
-            "policy": {},
-            "user_pubkey_digest": "",
-        }))?)
     }
 
     #[tokio::test]
@@ -403,9 +341,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simplified_csv_policy_accepts_allowed_measurement() -> Result<()> {
+    async fn reject_evidence_without_attestation_report() -> Result<()> {
         let verifier = crate::to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
-        let evidence = simplified_csv_evidence("abc123")?;
+        let evidence = b"{\"serial_number\":\"mock\"}";
         let challenge = ChallengeTokenClaims {
             tee: Tee::Csv as i32,
             mode: 1,
@@ -413,60 +351,13 @@ mod tests {
             issued_at: 0,
             expires_at: i64::MAX,
         };
-        let policy = AppraisalPolicy::from_toml(
-            r#"
-policy_id = "csv-week-two"
-csv_allowed_measurements = ["abc123"]
-"#,
-        )?;
-        let context =
-            VerificationContext::new(challenge, "file-backed").with_appraisal_policy(policy);
-
-        let signed_token = verifier.verify(&evidence, &context).await?;
-        let pub_key = include_bytes!("../../../test_certs/server_pubkey.json");
-        let mut ear = crate::Ear::from_jwt_jwk(&signed_token, Algorithm::ES384, pub_key)?;
-        ear.extensions
-            .register("rats.appraisal_policy_id", -70003, RawValueKind::String)?;
-        ear.extensions
-            .register("rats.appraisal_result", -70004, RawValueKind::String)?;
-
-        assert_eq!(
-            ear.extensions.get_by_name("rats.appraisal_policy_id"),
-            Some(RawValue::String("csv-week-two".to_string()))
-        );
-        assert_eq!(
-            ear.extensions.get_by_name("rats.appraisal_result"),
-            Some(RawValue::String("passed".to_string()))
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn simplified_csv_policy_rejects_unexpected_measurement() -> Result<()> {
-        let verifier = crate::to_verifier(&Tee::Csv).expect("failed to create CSV verifier");
-        let evidence = simplified_csv_evidence("unexpected")?;
-        let challenge = ChallengeTokenClaims {
-            tee: Tee::Csv as i32,
-            mode: 1,
-            nonce: "ZXhwZWN0ZWQtbm9uY2U".to_string(),
-            issued_at: 0,
-            expires_at: i64::MAX,
-        };
-        let policy = AppraisalPolicy::from_toml(
-            r#"
-policy_id = "csv-week-two"
-csv_allowed_measurements = ["expected"]
-"#,
-        )?;
-        let context =
-            VerificationContext::new(challenge, "file-backed").with_appraisal_policy(policy);
+        let context = VerificationContext::new(challenge, "file-backed");
 
         let err = verifier
-            .verify(&evidence, &context)
+            .verify(evidence, &context)
             .await
-            .expect_err("unexpected measurement should fail policy");
-
-        assert!(err.to_string().contains("rejected CSV measurement"));
+            .expect_err("CSV evidence without attestation_report must be rejected");
+        assert!(err.to_string().contains("attestation_report"));
         Ok(())
     }
 }

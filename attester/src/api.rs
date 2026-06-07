@@ -7,8 +7,8 @@ use protos::attestation_service_server::{
 use protos::verifier_service_client::VerifierServiceClient;
 use protos::{
     AttestationRequest, AttestationResponse, ChallengeRequest, ChallengeResponse, ErrorCode,
-    EvidenceList, Mode, Tee, VerificationRequest, VerificationResponse, VerifierChallengeRequest,
-    VerifierRequest,
+    EvidenceList, EvidenceSource, Mode, Tee, VerificationRequest, VerificationResponse,
+    VerifierChallengeRequest, VerifierRequest,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -71,14 +71,14 @@ impl VerifierGateway for GrpcVerifierGateway {
         tee: Tee,
         raw_evidence: &[u8],
         challenge_token: &[u8],
-        evidence_source: &str,
+        evidence_source: EvidenceSource,
     ) -> Result<String> {
         let mut client = self.connect().await?;
         let req = VerifierRequest {
             tee: tee as i32,
             evidence: raw_evidence.to_vec(),
             challenge_token: challenge_token.to_vec(),
-            evidence_source: evidence_source.to_string(),
+            evidence_source: evidence_source as i32,
         };
         let response = client.verify(Request::new(req)).await?.into_inner();
         if response.error_code != ErrorCode::Ok as i32 {

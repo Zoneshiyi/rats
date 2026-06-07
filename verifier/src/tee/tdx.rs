@@ -9,6 +9,9 @@ use crate::{
     verify_challenge_binding,
 };
 
+// ADR 0007: 当前阶段未接入真实 DCAP / PCCS 链路，binding 标签固定为 "simulated"。
+const BINDING_STATUS_SIMULATED: &str = "simulated";
+
 #[derive(Debug, Default)]
 pub struct TDX {}
 
@@ -85,9 +88,10 @@ fn gen_ear_token(quote: &Quote) -> Result<crate::Ear> {
     appraisal
         .extensions
         .set_by_key(EXT_RTMR3, RawValue::Bytes(Bytes(quote.rtmr3().to_vec())))?;
+    // ADR 0007: PCK chain 验证未接入，写入 0；接入 DCAP QVL 后改为动态值。
     appraisal
         .extensions
-        .set_by_key(EXT_PCK_CHAIN_VERIFIED, RawValue::Integer(1))?;
+        .set_by_key(EXT_PCK_CHAIN_VERIFIED, RawValue::Integer(0))?;
 
     appraisal.update_status_from_trust_vector();
 
@@ -103,13 +107,14 @@ impl Verifier for TDX {
 
         let quote = check_quote(raw_evidence)?;
 
-        let binding_status =
-            verify_challenge_binding(&quote.report_input_data(), &context.challenge)?;
+        // ADR 0007: challenge 比对仍执行（quote 自身字段层面，挡住明显的 nonce 不匹配），
+        // 但其结果不再决定 binding 状态——当前阶段统一标记为 simulated。
+        verify_challenge_binding(&quote.report_input_data(), &context.challenge)?;
         let mut ear_token = gen_ear_token(&quote)?;
         apply_challenge(
             &mut ear_token,
             &context.challenge,
-            binding_status.as_token_value(),
+            BINDING_STATUS_SIMULATED,
             context.evidence_source(),
         )?;
 

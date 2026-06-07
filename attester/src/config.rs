@@ -1,21 +1,13 @@
 use anyhow::{Result, bail};
-use protos::Tee;
+use protos::{EvidenceSource, Tee};
 use serde::Deserialize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EvidenceSource {
-    File,
-    GuestComponentsRest,
-    GuestComponentsGrpc,
-}
-
-impl EvidenceSource {
-    pub fn as_token_value(self) -> &'static str {
-        match self {
-            Self::File => "file-backed",
-            Self::GuestComponentsRest => "guest-components-rest",
-            Self::GuestComponentsGrpc => "guest-components-grpc",
-        }
+/// 把协议枚举映射为最终 EAR token 的人类可读字符串。
+pub fn evidence_source_token_value(source: EvidenceSource) -> &'static str {
+    match source {
+        EvidenceSource::Unspecified => "unspecified",
+        EvidenceSource::FileBacked => "file-backed",
+        EvidenceSource::GuestComponentsGrpc => "guest-components-grpc",
     }
 }
 
@@ -26,8 +18,8 @@ pub struct AttesterConfig {
     pub verifier_addr: String,
     #[serde(default = "default_evidence_source")]
     pub evidence_source: String,
-    #[serde(default = "default_aa_evidence_url")]
-    pub aa_evidence_url: String,
+    #[serde(default = "default_aa_endpoint")]
+    pub aa_endpoint: String,
     pub cca_evidence_path: String,
     pub tdx_evidence_path: String,
     pub csv_evidence_path: String,
@@ -38,8 +30,8 @@ fn default_evidence_source() -> String {
     "file".to_string()
 }
 
-fn default_aa_evidence_url() -> String {
-    "http://127.0.0.1:8006/aa/evidence".to_string()
+fn default_aa_endpoint() -> String {
+    "http://127.0.0.1:50002".to_string()
 }
 
 impl AttesterConfig {
@@ -64,8 +56,8 @@ impl AttesterConfig {
         if let Ok(evidence_source) = std::env::var("RATS_EVIDENCE_SOURCE") {
             config.evidence_source = evidence_source;
         }
-        if let Ok(aa_evidence_url) = std::env::var("RATS_AA_EVIDENCE_URL") {
-            config.aa_evidence_url = aa_evidence_url;
+        if let Ok(aa_endpoint) = std::env::var("RATS_AA_ENDPOINT") {
+            config.aa_endpoint = aa_endpoint;
         }
         if let Ok(cca_evidence_path) = std::env::var("RATS_CCA_EVIDENCE_PATH") {
             config.cca_evidence_path = cca_evidence_path;
@@ -94,10 +86,7 @@ impl AttesterConfig {
 
     pub fn parse_evidence_source(&self) -> Result<EvidenceSource> {
         match self.evidence_source.to_ascii_lowercase().as_str() {
-            "file" | "fixture" | "file-backed" => Ok(EvidenceSource::File),
-            "guest-components-rest" | "guest_components_rest" | "coco-rest" | "aa-rest" => {
-                Ok(EvidenceSource::GuestComponentsRest)
-            }
+            "file" | "fixture" | "file-backed" => Ok(EvidenceSource::FileBacked),
             "guest-components-grpc" | "guest_components_grpc" | "aa-grpc" => {
                 Ok(EvidenceSource::GuestComponentsGrpc)
             }
