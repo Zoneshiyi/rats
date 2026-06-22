@@ -15,19 +15,19 @@
 
 ### CSV — `hardware_verified`
 
-仅接受 trustee-style envelope（ADR 0001）。具备：
+仅接受 trustee-style envelope。具备：
 
 - attestation report V1 / V2 解析
 - `HRK → HSK → CEK → PEK` 证书链校验（本地 bundle / 可选 KDS 下载）
 - `PEK` 对 attestation report 的 SM2/SM3 签名校验
 - `report_data` 与 challenge nonce 比对
 
-Appraisal policy（ADR 0002，待落地完整化）：
+Appraisal policy（当前已落地以下两条规则，更完整的策略表达式仍在演进）：
 
 - `csv_allowed_measurements` 白名单匹配 `measure`
 - `policy.debug` 必须为 `false`（debug=on 允许调试器读 guest 内存）
 
-### TDX — `simulated`（ADR 0007）
+### TDX — `simulated`
 
 当前仅做：
 
@@ -42,9 +42,7 @@ Appraisal policy（ADR 0002，待落地完整化）：
 - TCB / SVN / RTMR 策略校验
 - QE / TD module identity 校验
 
-为避免 token 谎称硬件可信，binding 标签当前为 `simulated`，`pck_chain_verified` 字段在 ADR 落地后会从硬编码 `1` 改为 `0`。
-
-接入 DCAP 真实链路后将切回 `hardware_verified`，伴随 README §7.2 阶段。
+为避免 token 谎称硬件可信，binding 标签当前为 `simulated`，DCAP 链路真正接入后将切回 `hardware_verified`。
 
 ### Kunpeng — `simulated`
 
@@ -58,8 +56,6 @@ guest-components 当前不支持 Kunpeng，无法接入真实取证。仅做 JSO
 - 任何"部分可信"都属于 `Simulated` 范畴；
 - 三态会让 RP / 审计逻辑变成多分支判断，违反"不引入不必要抽象"原则。
 
-详见 ADR 0007。
-
 ## challenge / report data 兼容形态
 
 `verify_challenge_binding()` 兼容两种绑定形态，覆盖真实 TEE 常见场景：
@@ -67,4 +63,4 @@ guest-components 当前不支持 Kunpeng，无法接入真实取证。仅做 JSO
 1. evidence 中的 report data 与 nonce **完全一致**；
 2. evidence 中的 report data 为 `nonce + 零填充`，常见于 64 字节固定长度的 report data 字段。
 
-不匹配时直接拒签，不存在"降级签发 simulated"的隐藏路径——这条 invariant 由 ADR 0001 显式锁定。
+不匹配时直接拒签，不存在"降级签发 simulated"的隐藏路径——这条 invariant 由 verifier 主流程显式锁定。

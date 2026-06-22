@@ -33,7 +33,7 @@ relying-party ──gRPC──> attester ──gRPC──> verifier
 - `Verifier` trait：每种 TEE 的验证入口，返回最终 EAR/JWT token；
 - `VerifierFactory`：按 `Tee` 路由到具体 verifier 实现；
 - `ChallengeTokenManager`：challenge token 的签发与校验，service 层注入；
-- `ChallengeReplayGuard`（待落地，见 ADR 0005）：challenge consume-once；
+- `ChallengeReplayGuard`：challenge consume-once 防重放（`InMemoryChallengeReplayGuard` 已在 `verifier::service` 实现，verifier 在 `Verify` 入口处调用 `try_consume`）；
 - `VerificationContext`：贯穿验证流程的上下文（challenge claims、evidence_source、appraisal policy）；
 - `VerifierApplicationService`：编排 `issue_challenge` 与 `verify` 两个核心流程。
 

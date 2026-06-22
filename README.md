@@ -99,5 +99,3 @@ cargo check --workspace --all-targets
 - [协议](docs/protocol.md)
 - [TEE 状态详解](docs/tee-status.md)
 - [运行与配置](docs/running.md)
-- [设计决策（ADR）](.context/docs/adr/)
-- [领域术语表](.context/CONTEXT.md)

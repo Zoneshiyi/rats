@@ -33,7 +33,7 @@
 | `addr` | gRPC 监听地址 |
 | `tee` | 当前 attester 服务的 TEE 类型 |
 | `verifier_addr` | verifier 的地址 |
-| `evidence_source` | `file` / `guest-components-grpc` |
+| `evidence_source` | `file` / `file-backed` / `fixture`（fixture 取证）或 `guest-components-grpc` / `guest_components_grpc` / `aa-grpc`（AA gRPC 取证）；EAR token 写入归一化值 `file-backed` 或 `guest-components-grpc` |
 | `aa_endpoint` | guest-components AA gRPC endpoint（仅 gRPC 取证模式生效） |
 | `cca_evidence_path` 等 | 各 TEE 的 fixture 文件路径 |
 

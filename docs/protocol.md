@@ -33,7 +33,7 @@ verifier 签发，HMAC-SHA256 签名（结构类似 JWT，但 `typ = RATS_CHALLE
 | `issued_at` | 签发时间（Unix 秒） |
 | `expires_at` | 过期时间（默认 TTL 300 秒） |
 
-verifier 在 `Verify` 入口处校验 token 签名、过期、tee 匹配；challenge consume-once 防重放见 ADR 0005。
+verifier 在 `Verify` 入口处校验 token 签名、过期、tee 匹配；challenge consume-once 防重放由 `verifier::service::InMemoryChallengeReplayGuard` 实现，命中已消费条目返回 `INVALID_ARGUMENT`。
 
 ### Mode 取值
 
@@ -41,7 +41,7 @@ verifier 在 `Verify` 入口处校验 token 签名、过期、tee 匹配；chall
 |------|------|
 | `MODE_PASSPORT` | attester 内部完成 verifier 调用，返回 attestation token |
 | `MODE_BACKGROUND_CHECK` | attester 仅返回 evidence list |
-| `MODE_MIX` | reserved，attester 当前直接拒签（多 evidence 聚合方案见 ADR 0004） |
+| `MODE_MIX` | reserved，attester 当前直接拒签（多 evidence 聚合尚未落地） |
 
 ### Tee 取值
 
@@ -52,9 +52,9 @@ verifier 在 `Verify` 入口处校验 token 签名、过期、tee 匹配；chall
 | `TEE_CSV` | 完整链路（trustee-style） |
 | `TEE_KUNPENG` | Simulated（占位） |
 
-### EvidenceSource 取值（ADR 0006，待落地）
+### EvidenceSource 取值
 
-`evidence_source` 字段从字符串提升为协议级 enum：
+`evidence_source` 字段为 `attestation.proto` 中定义的 enum：
 
 ```proto
 enum EvidenceSource {
@@ -65,6 +65,8 @@ enum EvidenceSource {
 ```
 
 verifier 收到 `Unspecified`（含未知值）时拒签为 `InvalidArgument`。
+
+> 注：attester 端配置项 `evidence_source` 仍接受字符串 `"file"` / `"file-backed"` / `"guest-components-grpc"`，由 attester 在内部映射到上述 enum 后再下发。EAR token 的 `rats.evidence_source` 字段写入归一化后的 `"file-backed"` 或 `"guest-components-grpc"`。
 
 ### ErrorCode
 
